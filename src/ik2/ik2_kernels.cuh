@@ -297,8 +297,12 @@ struct MvAlt {
     const float* x = nullptr;
     int r0 = 0, n = 0;
 };
+struct MvAlt16 {
+    const uint16_t* x = nullptr;
+    int r0 = 0, n = 0;
+};
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
-             cudaStream_t s);
+             cudaStream_t s, const MvAlt16& a0 = MvAlt16{}, const MvAlt16& a1 = MvAlt16{});
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{});
 void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s);
@@ -441,6 +445,27 @@ size_t attn_block_scratch(int H, int T, int n_split);
 void conv_block(const float* x, int x_ld, float* hist, const float* w, const float* dyn, int d_ld, int heads, int T,
                 int C, const float* res, int res_ld, float* y, int y_ld, float* rec_old, float* rec_x,
                 cudaStream_t s);
+/// Two independent conv_block ops (K and V) in one launch.
+void conv_block_kv(const float* x0, int x0_ld, float* hist0, const float* w0, const float* dyn0, int d0_ld, int heads0,
+                   float* y0, int y0_ld, float* rec_old0, float* rec_x0,
+                   const float* x1, int x1_ld, float* hist1, const float* w1, const float* dyn1, int d1_ld, int heads1,
+                   float* y1, int y1_ld, float* rec_old1, float* rec_x1, int T, int C, cudaStream_t s);
+/// Multi-vector RMS norm for T rows each writing both FP16 and FP32 outputs in one launch (n <= 3).
+struct RmsF16Jobs {
+    const float* x[3];
+    const float* w[3];
+    uint16_t* y16[3];
+    float* y32[3];
+};
+void rms_multi_f16(const RmsF16Jobs& jobs, int n, int T, int D, float eps, cudaStream_t s);
+/// Fused route_rows + group_route + optional f16_limbs_rows in one launch for a block window (T * K <= 64, E <= 128).
+void route_group_block(const float* logits, const float* bias, int T, int E, int K, float scale,
+                       const uint8_t* const* tab, const float* sg_t, const float* su_t, const float* sd_t,
+                       const uint8_t** blob, int* n, int* tok, int* row, float* sg, float* su, float* wt, int* inv,
+                       const float* x, int width, uint16_t* x_limbs, cudaStream_t s);
+/// Fused moe_combine_f32 + conv_block (with residual add and rollback recording) in one launch for T <= 8.
+void moe_combine_conv_block(const float* y, const int* inv, const float* wt, int T, int K, int C, float* hist,
+                            const float* w, const float* res, float* out, float* rec_old, float* rec_x, cudaStream_t s);
 /// A conv's record of a window (conv_block's rec_old, rec_x) and its history.
 struct ConvRec {
     const float* old;

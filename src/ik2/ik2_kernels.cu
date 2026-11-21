@@ -239,6 +239,45 @@ __global__ void rms_multi_kernel(RmsJobs jobs, int D, float eps) {
     }
 }
 
+__global__ void rms_multi_f16_kernel(RmsF16Jobs jobs, int D, float eps) {
+    __shared__ float sh[kBlk];
+    const int j = blockIdx.y, t = blockIdx.x;
+    const float* xr = jobs.x[j] + (size_t) t * D;
+    const float* w = jobs.w[j];
+    float* y32r = jobs.y32[j] + (size_t) t * D;
+    uint16_t* y16r = jobs.y16[j] + (size_t) t * D;
+    const bool vec4 = (((uintptr_t) xr & 15) == 0) && (!w || ((uintptr_t) w & 15) == 0) &&
+                      (((uintptr_t) y32r & 15) == 0) && (((uintptr_t) y16r & 7) == 0) && ((D & 3) == 0);
+    float a = 0.0f;
+    if (vec4) {
+        const int n4 = D >> 2;
+        const float4* x4 = (const float4*) xr;
+        for (int d4 = threadIdx.x; d4 < n4; d4 += kBlk) {
+            const float4 v = __ldg(x4 + d4);
+            a += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        const float rs = rsqrtf(bsum(a, sh) / (float) D + eps);
+        const float4* w4 = (const float4*) w;
+        float4* y32_4 = (float4*) y32r;
+        uint2* y16_4 = (uint2*) y16r;
+        for (int d4 = threadIdx.x; d4 < n4; d4 += kBlk) {
+            const float4 v = __ldg(x4 + d4);
+            const float4 ww = w4 ? __ldg(w4 + d4) : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+            const float r0 = v.x * rs * ww.x, r1 = v.y * rs * ww.y, r2 = v.z * rs * ww.z, r3 = v.w * rs * ww.w;
+            y32_4[d4] = make_float4(r0, r1, r2, r3);
+            y16_4[d4] = make_uint2(f2_to_u32(r0, r1), f2_to_u32(r2, r3));
+        }
+    } else {
+        for (int d = threadIdx.x; d < D; d += kBlk) a += xr[d] * xr[d];
+        const float rs = rsqrtf(bsum(a, sh) / (float) D + eps);
+        for (int d = threadIdx.x; d < D; d += kBlk) {
+            const float r = xr[d] * rs * (w ? w[d] : 1.0f);
+            y32r[d] = r;
+            y16r[d] = f2h(r);
+        }
+    }
+}
+
 __device__ __forceinline__ float wsum(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -371,7 +410,27 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
         const uint16_t* w = sink_w + (size_t) h * sink_k;
         const float* sx = sink_x + (size_t) t * sink_k;
         float a = 0.0f;
-        for (int j = lane; j < sink_k; j += 32) a += h2f(w[j]) * sx[j];
+        if ((sink_k & 7) == 0 && (((uintptr_t) w & 15) == 0) && (((uintptr_t) sx & 15) == 0)) {
+            const uint4* w8 = (const uint4*) w;
+            const float4* x4 = (const float4*) sx;
+            const int n8 = sink_k >> 3;
+            for (int j = lane; j < n8; j += 32) {
+                const uint4 wv = __ldg(w8 + j);
+                const float4 x0 = __ldg(x4 + 2 * j), x1 = __ldg(x4 + 2 * j + 1);
+                const float2 f0 = u32_to_f2(wv.x), f1 = u32_to_f2(wv.y);
+                const float2 f2 = u32_to_f2(wv.z), f3 = u32_to_f2(wv.w);
+                a = fmaf(f0.x, x0.x, a);
+                a = fmaf(f0.y, x0.y, a);
+                a = fmaf(f1.x, x0.z, a);
+                a = fmaf(f1.y, x0.w, a);
+                a = fmaf(f2.x, x1.x, a);
+                a = fmaf(f2.y, x1.y, a);
+                a = fmaf(f3.x, x1.z, a);
+                a = fmaf(f3.y, x1.w, a);
+            }
+        } else {
+            for (int j = lane; j < sink_k; j += 32) a += h2f(__ldg(w + j)) * __ldg(sx + j);
+        }
         a = wsum(a);
         if (lane == 0) sink_y[(size_t) t * H + h] = a;
         return;
@@ -1881,6 +1940,122 @@ __global__ void loop_gate_apply_kernel(LoopGateArgs a, int T, int C, int R, floa
         const float gv = sh_g[r];
         f += gate_weight<Compact>(a.F[j], (size_t)r * C + c) * gv,
             gn += gate_weight<Compact>(a.G[j], (size_t)r * C + c) * gv;
+    }
+    const size_t i = (size_t) t * C + c;
+    a.y[j][i] = (1.0f - tanhf(f)) * a.x[j][i] + tanhf(gn) * a.m[j][i];
+}
+
+// Vectorized per-token loop gate kernels: full (R, n, T) and (C/tile, n, T) SM parallelism with float4/uint2 loads
+// and L2-cached D/F/G reuse, zero register spill.
+template <bool Compact>
+__device__ __forceinline__ float4 gate_weight4(const void* p, size_t i4) {
+    if constexpr (Compact) {
+        const uint2 u = __ldg((const uint2*) p + i4);
+        return make_float4(__uint_as_float((u.x & 0xFFFFu) << 16), __uint_as_float(u.x & 0xFFFF0000u),
+                           __uint_as_float((u.y & 0xFFFFu) << 16), __uint_as_float(u.y & 0xFFFF0000u));
+    } else {
+        return __ldg((const float4*) p + i4);
+    }
+}
+
+template <bool Compact>
+__global__ void loop_gate_dots_vec_kernel(LoopGateArgs a, int T, int C, int R, float* sc) {
+    __shared__ float sh[4][4];
+    const int r = blockIdx.x, j = blockIdx.y, t = blockIdx.z, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int c4 = C >> 2;
+    const size_t row4 = (size_t) r * 2 * c4;
+    const float4* x4 = (const float4*) (a.x[j] + (size_t) t * C);
+    const float4* m4 = (const float4*) (a.m[j] + (size_t) t * C);
+    float ax = 0.0f, am = 0.0f, sx = 0.0f, sm = 0.0f;
+    for (int i4 = tid; i4 < c4; i4 += 128) {
+        const float4 dx = gate_weight4<Compact>(a.D[j], row4 + i4);
+        const float4 dm = gate_weight4<Compact>(a.D[j], row4 + c4 + i4);
+        const float4 xv = __ldg(x4 + i4);
+        const float4 mv = __ldg(m4 + i4);
+        ax += dx.x * xv.x + dx.y * xv.y + dx.z * xv.z + dx.w * xv.w;
+        am += dm.x * mv.x + dm.y * mv.y + dm.z * mv.z + dm.w * mv.w;
+        if (r == 0) {
+            sx += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+            sm += mv.x * mv.x + mv.y * mv.y + mv.z * mv.z + mv.w * mv.w;
+        }
+    }
+    ax = wsum(ax);
+    am = wsum(am);
+    if (r == 0) sx = wsum(sx), sm = wsum(sm);
+    if (lane == 0) {
+        sh[warp][0] = ax;
+        sh[warp][1] = am;
+        if (r == 0) sh[warp][2] = sx, sh[warp][3] = sm;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float* o = sc + ((size_t) j * T + t) * (2 * R + 2);
+        o[2 * r] = sh[0][0] + sh[1][0] + sh[2][0] + sh[3][0];
+        o[2 * r + 1] = sh[0][1] + sh[1][1] + sh[2][1] + sh[3][1];
+        if (r == 0) {
+            o[2 * R] = sh[0][2] + sh[1][2] + sh[2][2] + sh[3][2];
+            o[2 * R + 1] = sh[0][3] + sh[1][3] + sh[2][3] + sh[3][3];
+        }
+    }
+}
+
+template <int Rank, bool Compact>
+__global__ void loop_gate_apply_vec4_kernel(LoopGateArgs a, int T, int C, int R, float eps, const float* __restrict__ sc) {
+    __shared__ float sh_g[kLoopRankMax];
+    const int j = blockIdx.y, t = blockIdx.z, tid = threadIdx.x;
+    const int n_r = Rank ? Rank : R;
+    const float* o = sc + ((size_t) j * T + t) * (2 * R + 2);
+    const float rx = rsqrtf(o[2 * R] / (float) C + eps), rm = rsqrtf(o[2 * R + 1] / (float) C + eps);
+    for (int r = tid; r < n_r; r += blockDim.x)
+        sh_g[r] = rx * o[2 * r] + rm * o[2 * r + 1];
+    __syncthreads();
+    const int c4 = (int) blockIdx.x * blockDim.x + tid;
+    const int n4 = C >> 2;
+    if (c4 >= n4) return;
+    float f0 = 0.0f, f1 = 0.0f, f2 = 0.0f, f3 = 0.0f;
+    float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
+#pragma unroll 4
+    for (int r = 0; r < n_r; ++r) {
+        const float gv = sh_g[r];
+        const size_t idx4 = (size_t) r * n4 + c4;
+        const float4 fv = gate_weight4<Compact>(a.F[j], idx4);
+        const float4 gnv = gate_weight4<Compact>(a.G[j], idx4);
+        f0 = fmaf(fv.x, gv, f0);
+        f1 = fmaf(fv.y, gv, f1);
+        f2 = fmaf(fv.z, gv, f2);
+        f3 = fmaf(fv.w, gv, f3);
+        g0 = fmaf(gnv.x, gv, g0);
+        g1 = fmaf(gnv.y, gv, g1);
+        g2 = fmaf(gnv.z, gv, g2);
+        g3 = fmaf(gnv.w, gv, g3);
+    }
+    const size_t i4 = (size_t) t * n4 + c4;
+    const float4 xv = __ldg((const float4*) a.x[j] + i4);
+    const float4 mv = __ldg((const float4*) a.m[j] + i4);
+    ((float4*) a.y[j])[i4] = make_float4((1.0f - tanhf(f0)) * xv.x + tanhf(g0) * mv.x,
+                                         (1.0f - tanhf(f1)) * xv.y + tanhf(g1) * mv.y,
+                                         (1.0f - tanhf(f2)) * xv.z + tanhf(g2) * mv.z,
+                                         (1.0f - tanhf(f3)) * xv.w + tanhf(g3) * mv.w);
+}
+
+template <int Rank, bool Compact>
+__global__ void loop_gate_apply_vec_kernel(LoopGateArgs a, int T, int C, int R, float eps, const float* __restrict__ sc) {
+    __shared__ float sh_g[kLoopRankMax];
+    const int j = blockIdx.y, t = blockIdx.z, tid = threadIdx.x;
+    const int n_r = Rank ? Rank : R;
+    const float* o = sc + ((size_t) j * T + t) * (2 * R + 2);
+    const float rx = rsqrtf(o[2 * R] / (float) C + eps), rm = rsqrtf(o[2 * R + 1] / (float) C + eps);
+    for (int r = tid; r < n_r; r += blockDim.x)
+        sh_g[r] = rx * o[2 * r] + rm * o[2 * r + 1];
+    __syncthreads();
+    const int c = (int) blockIdx.x * blockDim.x + tid;
+    if (c >= C) return;
+    float f = 0.0f, gn = 0.0f;
+#pragma unroll 4
+    for (int r = 0; r < n_r; ++r) {
+        const float gv = sh_g[r];
+        f = fmaf(gate_weight<Compact>(a.F[j], (size_t) r * C + c), gv, f);
+        gn = fmaf(gate_weight<Compact>(a.G[j], (size_t) r * C + c), gv, gn);
     }
     const size_t i = (size_t) t * C + c;
     a.y[j][i] = (1.0f - tanhf(f)) * a.x[j][i] + tanhf(gn) * a.m[j][i];
@@ -3723,7 +3898,27 @@ __global__ void mv_f16_kernel(const uint16_t* __restrict__ W, int N, int K, cons
     if (row >= N) return;
     const uint16_t* w = W + (size_t) row * K;
     float a = 0.0f;
-    for (int i = lane; i < K; i += 32) a += h2f(w[i]) * x[i];
+    if ((K & 7) == 0 && (((uintptr_t) w & 15) == 0) && (((uintptr_t) x & 15) == 0)) {
+        const uint4* w8 = (const uint4*) w;
+        const float4* x4 = (const float4*) x;
+        const int n8 = K >> 3;
+        for (int i = lane; i < n8; i += 32) {
+            const uint4 wv = __ldg(w8 + i);
+            const float4 x0 = __ldg(x4 + 2 * i), x1 = __ldg(x4 + 2 * i + 1);
+            const float2 f0 = u32_to_f2(wv.x), f1 = u32_to_f2(wv.y);
+            const float2 f2 = u32_to_f2(wv.z), f3 = u32_to_f2(wv.w);
+            a = fmaf(f0.x, x0.x, a);
+            a = fmaf(f0.y, x0.y, a);
+            a = fmaf(f1.x, x0.z, a);
+            a = fmaf(f1.y, x0.w, a);
+            a = fmaf(f2.x, x1.x, a);
+            a = fmaf(f2.y, x1.y, a);
+            a = fmaf(f3.x, x1.z, a);
+            a = fmaf(f3.y, x1.w, a);
+        }
+    } else {
+        for (int i = lane; i < K; i += 32) a += h2f(__ldg(w + i)) * __ldg(x + i);
+    }
     a = wsum(a);
     if (lane == 0) y[row] = a;
 }
@@ -3757,16 +3952,21 @@ __device__ __forceinline__ bool mv_conv_row(const MvConv& cv, int row, float x_n
 template <int Splits>
 __global__ void __launch_bounds__(Splits * 32)
 q8_mma_tile(const int8_t* __restrict__ q, const uint16_t* __restrict__ scales, int N, int K,
-            const uint16_t* __restrict__ x, int T, float* __restrict__ out, int ldy) {
+            const uint16_t* __restrict__ x, int T, float* __restrict__ out, int ldy,
+            MvAlt16 a0_alt = MvAlt16{}, MvAlt16 a1_alt = MvAlt16{}) {
     const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
-    const int row = 16 * blockIdx.x + g, token = 8 * blockIdx.y + g;
+    const int r_blk = 16 * blockIdx.x;
+    const int row = r_blk + g, token = 8 * blockIdx.y + g;
     const int row0 = min(row, N - 1), row1 = min(row + 8, N - 1);
     const int blocks = K >> 5;
+    const uint16_t* x_sel = (a0_alt.n && (unsigned)(r_blk - a0_alt.r0) < (unsigned)a0_alt.n) ? a0_alt.x
+                          : (a1_alt.n && (unsigned)(r_blk - a1_alt.r0) < (unsigned)a1_alt.n) ? a1_alt.x
+                                                                                              : x;
     const int8_t* q0 = q + (size_t)row0 * K + t * 8;
     const int8_t* q1 = q + (size_t)row1 * K + t * 8;
     const uint16_t* sc0 = scales + (size_t)row0 * blocks;
     const uint16_t* sc1 = scales + (size_t)row1 * blocks;
-    const uint16_t* xp = x + (size_t)min(token, T - 1) * K + t * 8;
+    const uint16_t* xp = x_sel + (size_t)min(token, T - 1) * K + t * 8;
     float acc[4] = {};
     if (split < blocks) {
         uint2 a0 = __ldg((const uint2*)(q0 + split * 32));
@@ -4222,6 +4422,7 @@ __global__ void argmax_gemv_f16_part_kernel(const uint16_t* W, int ld, const flo
             float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
             float d4 = 0.0f, d5 = 0.0f, d6 = 0.0f, d7 = 0.0f;
             const uint16_t* wr = W + v;
+#pragma unroll 4
             for (int r = 0; r < R; ++r, wr += ld) {
                 const float xr = use_smem ? sx[r] : __ldg(x + r);
                 const uint4 w8 = __ldg((const uint4*) wr);
@@ -4524,10 +4725,10 @@ unsigned grid(size_t n, int b = kBlk) { return (unsigned) ((n + b - 1) / b); }
 // ---- the block path: a few tokens at once (2 .. 8, a speculative step's verify window) on the resident path
 
 // the keys of a window of T tokens at pos0 .. pos0 + T - 1: steps of 16 from the first token's k_lo to the last token
-__device__ __forceinline__ int wa_active_block(int pos0, int T, int window, int nw, int& k_lo, int& n_steps) {
+__device__ __forceinline__ int wa_active_block(int pos0, int T, int window, int nw, int wa_min, int& k_lo, int& n_steps) {
     k_lo = window < (1 << 30) ? max(0, pos0 - window + 1) : 0;
     n_steps = (pos0 + T - k_lo + 15) >> 4;
-    return min(nw, (n_steps + kWaMin - 1) / kWaMin);
+    return min(nw, max(1, (n_steps + wa_min - 1) / wa_min));
 }
 
 // attn_decode_mma_kernel for the T tokens of a window: the B columns are (token, head) pairs of the K / V head -
@@ -4538,14 +4739,14 @@ __global__ void __launch_bounds__(kWaNW * 32, NT == 1 ? 4 : 2)
 attn_block_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
                       int kv_cap, int H, int Hkv, const int* __restrict__ pos_d, int T, float qk_scale,
                       const float* __restrict__ r, int r_ld, const float* __restrict__ proj, int d_rel, bool rel4,
-                      int extent, int window, int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part) {
+                      int extent, int window, int n_split, int wa_min, float* __restrict__ o_part, float2* __restrict__ ml_part) {
     constexpr bool F8 = sizeof(KVT) == 1;
     const int pos0 = *pos_d;
     const int lane = threadIdx.x & 31, gr = lane >> 2, tq = lane & 3;
     const int g = blockIdx.x, R = H / Hkv, KD = Hkv * kFaD, NC = T * R;
     const int w = blockIdx.y * kWaNW + (threadIdx.x >> 5);
     int k_lo, n_steps;
-    const int n_act = wa_active_block(pos0, T, window, n_split * kWaNW, k_lo, n_steps);
+    const int n_act = wa_active_block(pos0, T, window, n_split * kWaNW, wa_min, k_lo, n_steps);
     if (w >= n_act) return;
     const int per = (n_steps + n_act - 1) / n_act;
     const int st0 = min(n_steps, w * per), st1 = min(n_steps, st0 + per);
@@ -4757,14 +4958,14 @@ attn_block_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ 
 // attn_decode_mma_combine_kernel for a window: a block a (head, token); sink [T][H]; gate rows gate_ld apart;
 // out, out16 [T][H][D]
 __global__ void attn_block_combine_kernel(const float* __restrict__ o_part, const float2* __restrict__ ml_part,
-                                          int n_split, int H, int T, const float* __restrict__ sink, float v_inv,
+                                          int n_split, int wa_min, int H, int T, const float* __restrict__ sink, float v_inv,
                                           const int* pos_d, int window, const float* __restrict__ gate, int gate_ld,
                                           float* out, uint16_t* out16) {
     extern __shared__ float cm_sm[];
     float* red = cm_sm;
     float* cw = cm_sm + kFaD;
     int k_lo, n_steps;
-    const int n_act = wa_active_block(*pos_d, T, window, n_split * kWaNW, k_lo, n_steps);
+    const int n_act = wa_active_block(*pos_d, T, window, n_split * kWaNW, wa_min, k_lo, n_steps);
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x, TH = T * H, ix = t * H + h;
     const float sk = sink[ix] * kLog2e;
     float m = d == 0 ? sk : -INFINITY;
@@ -4814,6 +5015,45 @@ __global__ void conv_block_kernel(const float* __restrict__ x, int x_ld, float* 
     hist[c] = h0, hist[(size_t) C + c] = h1, hist[(size_t) 2 * C + c] = h2;
 }
 
+__global__ void conv_block_kv_kernel(const float* __restrict__ x0, int x0_ld, float* hist0, const float* __restrict__ w0,
+                                     const float* __restrict__ dyn0, int d0_ld, int heads0, float* y0, int y0_ld,
+                                     float* rec_old0, float* rec_x0,
+                                     const float* __restrict__ x1, int x1_ld, float* hist1, const float* __restrict__ w1,
+                                     const float* __restrict__ dyn1, int d1_ld, int heads1, float* y1, int y1_ld,
+                                     float* rec_old1, float* rec_x1, int T, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const bool s = blockIdx.y != 0;
+    const float* x = s ? x1 : x0;
+    const int x_ld = s ? x1_ld : x0_ld;
+    float* hist = s ? hist1 : hist0;
+    const float* w = s ? w1 : w0;
+    const float* dyn = s ? dyn1 : dyn0;
+    const int d_ld = s ? d1_ld : d0_ld;
+    const int heads = s ? heads1 : heads0;
+    float* y = s ? y1 : y0;
+    const int y_ld = s ? y1_ld : y0_ld;
+    float* rec_old = s ? rec_old1 : rec_old0;
+    float* rec_x = s ? rec_x1 : rec_x0;
+    float h0 = hist[c], h1 = hist[(size_t) C + c], h2 = hist[(size_t) 2 * C + c];
+    if (rec_old) rec_old[c] = h0, rec_old[(size_t) C + c] = h1, rec_old[(size_t) 2 * C + c] = h2;
+    const float* wc = w + (size_t) c * 4;
+    const float w_0 = wc[0], w_1 = wc[1], w_2 = wc[2], w_3 = wc[3];
+    const float* dc_base = dyn ? dyn + (size_t) (c / (C / heads)) * 4 : nullptr;
+    for (int t = 0; t < T; ++t) {
+        const float xn = x[(size_t) t * x_ld + c];
+        if (rec_x) rec_x[(size_t) t * C + c] = xn;
+        float a = w_0 * h0 + w_1 * h1 + w_2 * h2 + w_3 * xn;
+        if (dc_base) {
+            const float* dc = dc_base + (size_t) t * d_ld;
+            a += dc[0] * xn + dc[1] * h2 + dc[2] * h1 + dc[3] * h0;
+        }
+        y[(size_t) t * y_ld + c] = a;
+        h0 = h1, h1 = h2, h2 = xn;
+    }
+    hist[c] = h0, hist[(size_t) C + c] = h1, hist[(size_t) 2 * C + c] = h2;
+}
+
 // every short conv's history as after the first n of a window's tokens, all the layers' convs in one launch
 __global__ void rollback_block_kernel(const ConvRec* __restrict__ recs, int n) {
     const ConvRec rc = recs[blockIdx.y];
@@ -4841,6 +5081,160 @@ __global__ void mv_f16_rows_kernel(const uint16_t* __restrict__ W, int N, int K,
     for (int i = lane; i < K; i += 32) a += h2f(w[i]) * xt[i];
     a = wsum(a);
     if (lane == 0) y[(size_t) t * y_ld + row] = a;
+}
+
+// Vectorized per-token mv_f16_rows (full (N/4, T) SM parallelism + uint4/float4 loads + L2-cached W).
+template <int WARPS>
+__global__ void mv_f16_rows_vec_kernel(const uint16_t* __restrict__ W, int N, int K, const float* __restrict__ x,
+                                       int x_ld, float* __restrict__ y, int y_ld) {
+    const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31, t = blockIdx.y;
+    if (row >= N) return;
+    const uint4* w8 = (const uint4*) (W + (size_t) row * K);
+    const float4* x4 = (const float4*) (x + (size_t) t * x_ld);
+    const int n8 = K >> 3;
+    float a = 0.0f;
+    for (int i = lane; i < n8; i += 32) {
+        const uint4 wv = __ldg(w8 + i);
+        const float4 x0 = __ldg(x4 + 2 * i), x1 = __ldg(x4 + 2 * i + 1);
+        const float2 f0 = u32_to_f2(wv.x), f1 = u32_to_f2(wv.y);
+        const float2 f2 = u32_to_f2(wv.z), f3 = u32_to_f2(wv.w);
+        a = fmaf(f0.x, x0.x, a);
+        a = fmaf(f0.y, x0.y, a);
+        a = fmaf(f1.x, x0.z, a);
+        a = fmaf(f1.y, x0.w, a);
+        a = fmaf(f2.x, x1.x, a);
+        a = fmaf(f2.y, x1.y, a);
+        a = fmaf(f3.x, x1.z, a);
+        a = fmaf(f3.y, x1.w, a);
+    }
+    a = wsum(a);
+    if (lane == 0) y[(size_t) t * y_ld + row] = a;
+}
+
+// Fused moe_combine_f32 + conv_block (with residual add and rollback recording) in one launch for T <= 8.
+__global__ void moe_combine_conv_block_kernel(const float* __restrict__ y, const int* __restrict__ inv,
+                                              const float* __restrict__ wt, int T, int K, int C, float* hist,
+                                              const float* __restrict__ w, const float* __restrict__ res,
+                                              float* __restrict__ out, float* rec_old, float* rec_x) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float h0 = hist[c], h1 = hist[(size_t) C + c], h2 = hist[(size_t) 2 * C + c];
+    if (rec_old) rec_old[c] = h0, rec_old[(size_t) C + c] = h1, rec_old[(size_t) 2 * C + c] = h2;
+    const float* wc = w + (size_t) c * 4;
+    const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+    for (int t = 0; t < T; ++t) {
+        float xn = 0.0f;
+        const int base = t * K;
+        for (int k = 0; k < K; ++k) {
+            const int s = base + k;
+            xn = fmaf(__ldg(wt + s), __ldg(y + (size_t) __ldg(inv + s) * C + c), xn);
+        }
+        if (rec_x) rec_x[(size_t) t * C + c] = xn;
+        float a = w0 * h0 + w1 * h1 + w2 * h2 + w3 * xn;
+        if (res) a += __ldg(res + (size_t) t * C + c);
+        out[(size_t) t * C + c] = a;
+        h0 = h1, h1 = h2, h2 = xn;
+    }
+    hist[c] = h0, hist[(size_t) C + c] = h1, hist[(size_t) 2 * C + c] = h2;
+}
+
+// Fused parallel route_rows + group_route (block 0, T*128 threads) + f16_limbs_rows (blocks 1+) in one launch.
+__global__ void route_group_block_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int T, int E,
+                                         int K, float scale, const uint8_t* const* __restrict__ tab,
+                                         const float* __restrict__ sg_t, const float* __restrict__ su_t,
+                                         const float* __restrict__ sd_t, const uint8_t** blob, int* n, int* tok,
+                                         int* row, float* sg, float* su, float* wt, int* inv,
+                                         const float* __restrict__ x, int width, uint16_t* x_limbs) {
+    if (blockIdx.x) {
+        const int idx = (blockIdx.x - 1) * blockDim.x + threadIdx.x;
+        if (x_limbs && idx < T * width) {
+            const int t = idx / width, c = idx % width;
+            const float xv = __ldg(x + idx);
+            const uint16_t hi = f2h(xv);
+            x_limbs[(size_t) t * 2 * width + c] = hi;
+            x_limbs[(size_t) t * 2 * width + width + c] = f2h(xv - h2f(hi));
+        }
+        return;
+    }
+    __shared__ float val[8][128];
+    __shared__ uint32_t picked[8][4];
+    __shared__ float sig[8][kRouteMax + 1];
+    __shared__ int ex[64], lead[64], gid[64];
+    __shared__ float wt_s[64];
+    const int tid = threadIdx.x;
+    const int t = tid >> 7, e = tid & 127, lane = e & 31, warp = e >> 5;
+    const int S = T * K;
+    const float* lg = logits + (size_t) t * E;
+    const float sl = e < E ? 1.0f / (1.0f + expf(-__ldg(lg + e))) : 0.0f;
+    const float v = e < E ? sl + __ldg(bias + e) : -INFINITY;
+    val[t][e] = v;
+    __syncthreads();
+    int rank = 0;
+    if (e < E) {
+        for (int j = 0; j < E; ++j) {
+            const float o = val[t][j];
+            rank += (o > v || (o == v && j < e)) ? 1 : 0;
+        }
+    }
+    const bool pick = e < E && rank < K;
+    const uint32_t mine = __ballot_sync(0xffffffffu, pick);
+    if (lane == 0) picked[t][warp] = mine;
+    __syncthreads();
+    int pos = __popc(mine & ((1u << lane) - 1u));
+    for (int ww = 0; ww < warp; ++ww) pos += __popc(picked[t][ww]);
+    if (pick) {
+        ex[t * K + pos] = e;
+        sig[t][pos] = sl;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float s = lane < K ? sig[t][lane] : 0.0f;
+        s = wsum(s);
+        const float inv_s = s > 0.0f ? scale / s : 0.0f;
+        if (lane < K) wt_s[t * K + lane] = sig[t][lane] * inv_s;
+    }
+    __syncthreads();
+    // Group the S slots by expert (exact group_route_kernel logic in shared memory)
+    const int i = tid;
+    if (i < 64) {
+        const int ee = i < S ? ex[i] : -1;
+        if (i < S) n[i] = 0;
+        int first = i, m = 0, cnt = 0;
+        if (i < S) {
+            for (int j = 0; j < S; ++j)
+                if (ex[j] == ee) {
+                    if (j < first) first = j;
+                    if (j < i) ++m;
+                    ++cnt;
+                }
+        }
+        lead[i] = (i < S && first == i) ? 1 : 0;
+    }
+    __syncthreads();
+    if (i < 64 && lead[i]) {
+        int gx = 0;
+        for (int j = 0; j < i; ++j) gx += lead[j];
+        gid[i] = gx;
+    }
+    __syncthreads();
+    if (i < S) {
+        const int ee = ex[i];
+        int first = i, m = 0, cnt = 0;
+        for (int j = 0; j < S; ++j)
+            if (ex[j] == ee) {
+                if (j < first) first = j;
+                if (j < i) ++m;
+                ++cnt;
+            }
+        const int g = gid[first];
+        tok[g * kGroupMax + m] = i / K;
+        row[g * kGroupMax + m] = i;
+        if (first == i) blob[g] = tab[ee], n[g] = cnt;
+        sg[i] = sg_t ? sg_t[ee] : 1.0f;
+        su[i] = su_t ? su_t[ee] : 1.0f;
+        wt[i] = wt_s[i] * (sd_t ? sd_t[ee] : 1.0f);
+        inv[i] = i;
+    }
 }
 
 // x [T][C] as two FP16 limbs a token, out [T][2][C] (hi, lo; x = hi + lo)
@@ -5510,13 +5904,47 @@ void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float
         a.F[j] = compact ? (const void*)gt[j].compact[1] : gt[j].F;
         a.G[j] = compact ? (const void*)gt[j].compact[2] : gt[j].G;
     }
+    const bool vec_ok = (C % 4 == 0) && ((((uintptr_t) a.x[0] | (uintptr_t) a.m[0] | (uintptr_t) a.y[0]) & 15) == 0);
+    static const int tile_env = getenv("IK2_GATE_TILE") ? atoi(getenv("IK2_GATE_TILE")) : 128;
+    const int tile = (tile_env == 32 || tile_env == 64 || tile_env == 128) ? tile_env : 128;
+    static const bool gate_vec4 = !(getenv("IK2_GATE_VEC4") && !atoi(getenv("IK2_GATE_VEC4")));
+    if (vec_ok) {
+        const dim3 dots(R, n, T);
+        if (compact) loop_gate_dots_vec_kernel<true><<<dots, 128, 0, s>>>(a, T, C, R, sc);
+        else loop_gate_dots_vec_kernel<false><<<dots, 128, 0, s>>>(a, T, C, R, sc);
+        check("loop_gates (dots_vec)");
+        if (gate_vec4) {
+            const int n4 = C >> 2;
+            const int threads = (n * T >= 12) ? 64 : 32;
+            const dim3 apply((n4 + threads - 1) / threads, n, T);
+            if (R == 64) {
+                if (compact) loop_gate_apply_vec4_kernel<64, true><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
+                else loop_gate_apply_vec4_kernel<64, false><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
+            } else {
+                if (compact) loop_gate_apply_vec4_kernel<0, true><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
+                else loop_gate_apply_vec4_kernel<0, false><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
+            }
+            check("loop_gates (apply_vec4)");
+            return;
+        }
+        const int threads = (R == 64) ? tile : kBlk;
+        const dim3 apply((C + threads - 1) / threads, n, T);
+        if (R == 64) {
+            if (compact) loop_gate_apply_vec_kernel<64, true><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
+            else loop_gate_apply_vec_kernel<64, false><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
+        } else {
+            if (compact) loop_gate_apply_vec_kernel<0, true><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
+            else loop_gate_apply_vec_kernel<0, false><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
+        }
+        check("loop_gates (apply_vec)");
+        return;
+    }
     const dim3 dots(R, n, T);
     if (compact)
         loop_gate_dots_kernel<true><<<dots, 128, 0, s>>>(a, T, C, R, sc);
     else
         loop_gate_dots_kernel<false><<<dots, 128, 0, s>>>(a, T, C, R, sc);
     check("loop_gates (dots)");
-    static const int tile = getenv("IK2_GATE_TILE") ? atoi(getenv("IK2_GATE_TILE")) : 0;
     const bool fixed = T == 1 && R == 64 && (tile == 32 || tile == 64 || tile == 128);
     const int threads = fixed ? tile : kBlk;
     const dim3 apply((C + threads - 1) / threads, n, T);
@@ -6018,15 +6446,15 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
 }
 
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
-             cudaStream_t s) {
+             cudaStream_t s, const MvAlt16& a0, const MvAlt16& a1) {
     static const int sp_small = getenv("IK2_Q8_TILE_SMALL") ? atoi(getenv("IK2_Q8_TILE_SMALL")) : 8;
     const dim3 g((N + 15) / 16, (T + 7) / 8);
-    if (N <= 4096 && sp_small == 8)
-        q8_mma_tile<8><<<g, 256, 0, s>>>(q, d, N, K, x, T, y, ldy);
-    else if (N <= 4096 && sp_small == 6)
-        q8_mma_tile<6><<<g, 192, 0, s>>>(q, d, N, K, x, T, y, ldy);
+    if (N <= 16384 && sp_small == 8)
+        q8_mma_tile<8><<<g, 256, 0, s>>>(q, d, N, K, x, T, y, ldy, a0, a1);
+    else if (N <= 16384 && sp_small == 6)
+        q8_mma_tile<6><<<g, 192, 0, s>>>(q, d, N, K, x, T, y, ldy, a0, a1);
     else
-        q8_mma_tile<4><<<g, 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
+        q8_mma_tile<4><<<g, 128, 0, s>>>(q, d, N, K, x, T, y, ldy, a0, a1);
     check("q8_mma_tile");
 }
 
@@ -6244,16 +6672,17 @@ static void attn_block_launch(const uint16_t* q16, const float* r, int r_ld, con
                               float qk_scale, float v_inv, const float* proj, int d_rel, int extent, int window,
                               float* scratch, float* out, const float* gate, int gate_ld, uint16_t* out16,
                               cudaStream_t s) {
+    static const int wa_min = std::max(1, getenv("IK2_ATTN_WAMIN") ? atoi(getenv("IK2_ATTN_WAMIN")) : 2);
     float* o_part = scratch;
     float2* ml_part = (float2*) (o_part + (size_t) n_split * kWaNW * T * H * kFaD);
     const bool rel4 = d_rel % 4 == 0 && r_ld % 4 == 0 && (((uintptr_t) r | (uintptr_t) proj) & 15) == 0;
     attn_block_mma_kernel<KV, NT><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
-        q16, kc, vc, kv_cap, H, Hkv, pos, T, qk_scale, r, r_ld, proj, d_rel, rel4, extent, window, n_split, o_part,
-        ml_part);
+        q16, kc, vc, kv_cap, H, Hkv, pos, T, qk_scale, r, r_ld, proj, d_rel, rel4, extent, window, n_split, wa_min,
+        o_part, ml_part);
     check("attn_block_mma");
     attn_block_combine_kernel<<<dim3((unsigned) H, (unsigned) T), kFaD,
                                 (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
-        o_part, ml_part, n_split, H, T, sink, v_inv, pos, window, gate, gate_ld, out, out16);
+        o_part, ml_part, n_split, wa_min, H, T, sink, v_inv, pos, window, gate, gate_ld, out, out16);
     check("attn_block_mma (combine)");
 }
 template <class KV>
@@ -6302,6 +6731,47 @@ void conv_block(const float* x, int x_ld, float* hist, const float* w, const flo
                                                                    T, C, res, res_ld, y, y_ld, rec_old, rec_x);
     check("conv_block");
 }
+void conv_block_kv(const float* x0, int x0_ld, float* hist0, const float* w0, const float* dyn0, int d0_ld, int heads0,
+                   float* y0, int y0_ld, float* rec_old0, float* rec_x0,
+                   const float* x1, int x1_ld, float* hist1, const float* w1, const float* dyn1, int d1_ld, int heads1,
+                   float* y1, int y1_ld, float* rec_old1, float* rec_x1, int T, int C, cudaStream_t s) {
+    if (T <= 0) return;
+    conv_block_kv_kernel<<<dim3((unsigned) ((C + 127) / 128), 2u), 128, 0, s>>>(
+        x0, x0_ld, hist0, w0, dyn0, d0_ld, heads0 > 0 ? heads0 : 1, y0, y0_ld, rec_old0, rec_x0,
+        x1, x1_ld, hist1, w1, dyn1, d1_ld, heads1 > 0 ? heads1 : 1, y1, y1_ld, rec_old1, rec_x1, T, C);
+    check("conv_block_kv");
+}
+void rms_multi_f16(const RmsF16Jobs& jobs, int n, int T, int D, float eps, cudaStream_t s) {
+    if (n <= 0 || T <= 0) return;
+    rms_multi_f16_kernel<<<dim3((unsigned) T, (unsigned) n), kBlk, 0, s>>>(jobs, D, eps);
+    check("rms_multi_f16");
+}
+void route_group_block(const float* logits, const float* bias, int T, int E, int K, float scale,
+                       const uint8_t* const* tab, const float* sg_t, const float* su_t, const float* sd_t,
+                       const uint8_t** blob, int* n, int* tok, int* row, float* sg, float* su, float* wt, int* inv,
+                       const float* x, int width, uint16_t* x_limbs, cudaStream_t s) {
+    const int S = T * K;
+    if (S <= 0) return;
+    if (T >= 1 && T <= 8 && E <= 128 && S <= 64 && K <= kRouteMax) {
+        const unsigned nt = (unsigned) (T * 128);
+        const unsigned nb = 1u + (x_limbs ? (unsigned) ((T * width + (int) nt - 1) / (int) nt) : 0u);
+        route_group_block_kernel<<<nb, nt, 0, s>>>(logits, bias, T, E, K, scale, tab, sg_t, su_t, sd_t, blob, n, tok,
+                                                   row, sg, su, wt, inv, x, width, x_limbs);
+        check("route_group_block");
+        return;
+    }
+    // Fallback shouldn't be hit on Inkling-2-Mini (E=128, K=8, T<=8)
+    std::fprintf(stderr, "ik2::k::route_group_block: unsupported T=%d E=%d S=%d K=%d\n", T, E, S, K);
+    std::abort();
+}
+void moe_combine_conv_block(const float* y, const int* inv, const float* wt, int T, int K, int C, float* hist,
+                            const float* w, const float* res, float* out, float* rec_old, float* rec_x,
+                            cudaStream_t s) {
+    if (T <= 0) return;
+    moe_combine_conv_block_kernel<<<(unsigned) ((C + 127) / 128), 128, 0, s>>>(y, inv, wt, T, K, C, hist, w, res, out,
+                                                                               rec_old, rec_x);
+    check("moe_combine_conv_block");
+}
 void rollback_block(const ConvRec* recs, int n_recs, int n, cudaStream_t s) {
     if (n_recs <= 0) return;
     rollback_block_kernel<<<dim3(8, (unsigned) n_recs), 256, 0, s>>>(recs, n);
@@ -6310,6 +6780,12 @@ void rollback_block(const ConvRec* recs, int n_recs, int n, cudaStream_t s) {
 void mv_f16_rows(const uint16_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
                  cudaStream_t s) {
     if (N <= 0 || T <= 0) return;
+    const bool vec = (K % 8 == 0) && (x_ld % 4 == 0) && (((uintptr_t) W & 15) == 0) && (((uintptr_t) x & 15) == 0);
+    if (vec) {
+        mv_f16_rows_vec_kernel<4><<<dim3((unsigned) ((N + 3) / 4), (unsigned) T), 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld);
+        check("mv_f16_rows_vec");
+        return;
+    }
     mv_f16_rows_kernel<4><<<dim3((unsigned) ((N + 3) / 4), (unsigned) T), 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld);
     check("mv_f16_rows");
 }
@@ -6346,11 +6822,12 @@ void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, 
 void experts_block_down(const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
                         int F, const uint16_t* h, float* y, cudaStream_t s) {
     if (G <= 0) return;
-    static const int sp = getenv("IK2_BLOCK_DOWN_SPLIT") ? atoi(getenv("IK2_BLOCK_DOWN_SPLIT")) : 4;
+    static const int sp = getenv("IK2_BLOCK_DOWN_SPLIT") ? atoi(getenv("IK2_BLOCK_DOWN_SPLIT")) : 6;
     const dim3 g((unsigned) (C / 16), (unsigned) G);
     if (sp == 3) experts_block_down_kernel<3><<<g, 96, 0, s>>>(blob, n, row, off_down, C, F, h, y);
-    else if (sp == 6) experts_block_down_kernel<6><<<g, 192, 0, s>>>(blob, n, row, off_down, C, F, h, y);
-    else experts_block_down_kernel<4><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y);
+    else if (sp == 4) experts_block_down_kernel<4><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y);
+    else if (sp == 8) experts_block_down_kernel<8><<<g, 256, 0, s>>>(blob, n, row, off_down, C, F, h, y);
+    else experts_block_down_kernel<6><<<g, 192, 0, s>>>(blob, n, row, off_down, C, F, h, y);
     check("experts_block_down");
 }
 void prep_qkv_r_fp8_block(float* q, int q_ld, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in,
@@ -6402,8 +6879,11 @@ void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* to
 void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
                            int F, const uint16_t* h, float* y, cudaStream_t s) {
     if (G <= 0) return;
-    experts_block_down_q8_kernel<4><<<dim3((unsigned) (C / 16), (unsigned) G), 128, 0, s>>>(blob, n, row, off_down, C,
-                                                                                            F, h, y);
+    static const int sp = getenv("IK2_BLOCK_DOWN_Q8_SPLIT") ? atoi(getenv("IK2_BLOCK_DOWN_Q8_SPLIT")) : 8;
+    const dim3 g((unsigned) (C / 16), (unsigned) G);
+    if (sp == 4) experts_block_down_q8_kernel<4><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y);
+    else if (sp == 6) experts_block_down_q8_kernel<6><<<g, 192, 0, s>>>(blob, n, row, off_down, C, F, h, y);
+    else experts_block_down_q8_kernel<8><<<g, 256, 0, s>>>(blob, n, row, off_down, C, F, h, y);
     check("experts_block_down_q8");
 }
 

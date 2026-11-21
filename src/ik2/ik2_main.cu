@@ -655,11 +655,11 @@ void mv1c(const Mat& m, const float* x, float* y, const k::MvConv& c0, const k::
         if (cv->n) k::conv4_res(y + cv->r0, cv->hist, cv->w, cv->dyn, cv->heads, 1, cv->n, cv->res, cv->y, s);
 }
 
-static bool g_par_stream_inited = false, g_par_stream = true;
+static bool g_par_stream_inited = false, g_par_stream = false;
 static bool par_stream_on() {
     if (!g_par_stream_inited) {
         g_par_stream_inited = true;
-        g_par_stream = !(getenv("IK2_PAR_STREAM") && !atoi(getenv("IK2_PAR_STREAM")));
+        g_par_stream = getenv("IK2_PAR_STREAM") && atoi(getenv("IK2_PAR_STREAM"));
     }
     return g_par_stream;
 }
@@ -2333,50 +2333,59 @@ __global__ void stage_selected_experts(const uint8_t* const* table, const uint8_
 
 static struct FastProf {
     bool on = false;
+    bool block_on = false;
     bool inited = false;
     int calls = 0;
     double wall_ms = 0, gpu_ms = 0;
-    double ph[9] = {}; // 0:res_gate 1:qkv 2:attn 3:wo 4:ffn_route 5:exp_nvfp4 6:exp_q8 7:moe_comb 8:head
+    double ph[10] = {}; // 0:res_gate 1:qkv 2:attn 3:wo 4:ffn_route 5:exp_nvfp4 6:exp_q8 7:moe_comb 8:head 9:loop_bank
     cudaEvent_t ev0 = nullptr, ev1 = nullptr;
     static constexpr int kMaxRec = 512;
     cudaEvent_t pev[kMaxRec * 2] = {};
     int pid[kMaxRec] = {};
     int nrec = 0;
+    bool capturing = false;
     void init() {
         if (inited) return;
         inited = true;
         on = getenv("IK2_FAST_PROF") && atoi(getenv("IK2_FAST_PROF"));
-        if (on) {
+        block_on = getenv("IK2_BLOCK_PROF") && atoi(getenv("IK2_BLOCK_PROF"));
+        if (on || block_on) {
             CU(cudaEventCreate(&ev0)); CU(cudaEventCreate(&ev1));
             for (int i = 0; i < kMaxRec * 2; ++i) CU(cudaEventCreate(&pev[i]));
         }
     }
-    void begin_tok() { nrec = 0; }
-    void pstart() {
-        if (on && !g_graph && calls > 0 && nrec < kMaxRec) CU(cudaEventRecord(pev[2 * nrec], g_s));
+    void begin_capture() { nrec = 0; capturing = true; }
+    void end_capture() { capturing = false; }
+    void pstart(bool is_blk = false) {
+        const bool active = is_blk ? block_on : on;
+        if (!active || !capturing || nrec >= kMaxRec) return;
+        CU(cudaEventRecordWithFlags(pev[2 * nrec], g_s, cudaEventRecordExternal));
     }
-    void pend(int idx) {
-        if (!on || g_graph || calls <= 0 || nrec >= kMaxRec) return;
-        CU(cudaEventRecord(pev[2 * nrec + 1], g_s));
+    void pend(int idx, bool is_blk = false) {
+        const bool active = is_blk ? block_on : on;
+        if (!active || !capturing || nrec >= kMaxRec) return;
+        CU(cudaEventRecordWithFlags(pev[2 * nrec + 1], g_s, cudaEventRecordExternal));
         pid[nrec++] = idx;
     }
-    void collect() {
-        if (!on || g_graph || calls <= 0) return;
+    void collect(bool is_blk = false) {
+        const bool active = is_blk ? block_on : on;
+        if (!active || nrec <= 0) return;
         for (int i = 0; i < nrec; ++i) {
             float ms = 0;
             CU(cudaEventElapsedTime(&ms, pev[2 * i], pev[2 * i + 1]));
             ph[pid[i]] += ms;
         }
     }
-    void dump(int n) {
-        if (!on || n <= 0) return;
+    void dump(const char* tag, int n) {
+        if (n <= 0) return;
+        double sum = 0;
+        for (int i = 0; i < 10; ++i) sum += ph[i];
         std::fprintf(stderr,
-            "fast_prof (%d toks): wall=%.3f ms/tok (%.1f tok/s), gpu=%.3f ms/tok (%.1f tok/s) | "
-            "res=%.3f qkv=%.3f attn=%.3f wo=%.3f route=%.3f exp_nvfp4=%.3f exp_q8=%.3f comb=%.3f head=%.3f (sum=%.3f)\n",
-            n, wall_ms / n, 1000.0 * n / wall_ms, gpu_ms / n, 1000.0 * n / gpu_ms,
-            ph[0]/n, ph[1]/n, ph[2]/n, ph[3]/n, ph[4]/n,
-            ph[5]/n, ph[6]/n, ph[7]/n, ph[8]/n,
-            (ph[0]+ph[1]+ph[2]+ph[3]+ph[4]+ph[5]+ph[6]+ph[7]+ph[8])/n);
+            "%s (%d calls): wall=%.3f ms, gpu=%.3f ms | "
+            "bank=%.3f res=%.3f qkv=%.3f attn=%.3f wo=%.3f route=%.3f exp_nv=%.3f exp_q8=%.3f comb=%.3f head=%.3f (sum=%.3f)\n",
+            tag, n, wall_ms / n, gpu_ms / n,
+            ph[9]/n, ph[0]/n, ph[1]/n, ph[2]/n, ph[3]/n, ph[4]/n,
+            ph[5]/n, ph[6]/n, ph[7]/n, ph[8]/n, sum/n);
     }
 } g_fprof;
 
@@ -2685,18 +2694,25 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     W.pos_h[0] = pos;
     g_last_captured = false;
     if (!g_graph) {
-        g_fprof.begin_tok();
-        if (g_fprof.on) CU(cudaEventRecord(g_fprof.ev0, g_s));
+        if (g_fprof.on) {
+            g_fprof.begin_capture();
+            CU(cudaEventRecord(g_fprof.ev0, g_s));
+        }
         fast_token_launches(M, W, out_mode);
-        if (g_fprof.on) CU(cudaEventRecord(g_fprof.ev1, g_s));
+        if (g_fprof.on) {
+            CU(cudaEventRecord(g_fprof.ev1, g_s));
+            g_fprof.end_capture();
+        }
     } else {
         FastGraph& G =
             g_fgraph[(tier_active && (stage_cold || !host_plan.active.empty())) || host_plan.forced][(int)out_mode];
         if (!G.exec) {   // the first token of this kind: its launches recorded
             g_last_captured = true;
+            if (g_fprof.on) g_fprof.begin_capture();
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
             fast_token_launches(M, W, out_mode);
             CU(cudaStreamEndCapture(g_s, &G.graph));
+            if (g_fprof.on) g_fprof.end_capture();
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
         if (g_fprof.on) CU(cudaEventRecord(g_fprof.ev0, g_s));
@@ -2711,10 +2727,10 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
         if (g_fprof.calls > 0) {
             g_fprof.wall_ms += wms;
             g_fprof.gpu_ms += gms;
-            g_fprof.collect();
+            g_fprof.collect(false);
         }
         ++g_fprof.calls;
-        if (g_fprof.calls == 51) g_fprof.dump(50);
+        if (g_fprof.calls == 51) g_fprof.dump("fast_token_graph_prof", 50);
     }
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(1, W.argmax_h[0]);
@@ -2784,10 +2800,11 @@ void block_init(Model& M) {
 }
 
 // rows [r0, r0 + n) of a planar Q8_0 matrix times x16 [T][K] (FP16): y [T][ldy] (the tensor cores, q8_tile)
-void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y, int ldy, cudaStream_t s = nullptr) {
+void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y, int ldy, cudaStream_t s = nullptr,
+               const k::MvAlt16& a0 = k::MvAlt16{}, const k::MvAlt16& a1 = k::MvAlt16{}) {
     if (!s) s = g_s;
     if (!m.q8) die("the block path: a dense matrix that is not planar Q8_0");
-    k::q8_tile(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x16, T, y, ldy, s);
+    k::q8_tile(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x16, T, y, ldy, s, a0, a1);
 }
 
 void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
@@ -2806,6 +2823,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         Layer& Ly = bind_visit(M, vis);
         const float* msg = nullptr;
         if (c.n_pass > 1 && l == c.core0) {
+            g_fprof.pstart(true);
             if (M.V[vis].pass == 0) {
                 nb_pre = nb;
                 CU(cudaMemcpyAsync(W.lp_pre, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
@@ -2822,6 +2840,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                 k::attn_res_jobs_block(st, n_bank, M.lp_query_all, 2, 2 * (c.core1 - c.core0), T, C, 1e-6f,
                                        g_blk.lp_msg, g_s);
             }
+            g_fprof.pend(9, true);
         }
         if (M.V[vis].pass > 0) msg = g_blk.lp_msg + (size_t) (l - c.core0) * 4 * TC;   // [4][T][C]: q, k, v, MoE
         if (g_taps) {
@@ -2829,6 +2848,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             if (tap >= 0)
                 CU(cudaMemcpyAsync(g_taps + (size_t) tap * g_taps_ld * C, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         }
+        g_fprof.pstart(true);
         float* x3[3] = {W.xq, W.xk, W.xv};
         uint16_t* y16[3] = {W.x16, W.xk16, W.xv16};
         const float* nw[3] = {Ly.sliding ? Ly.attn_norm : Ly.q_in_norm, Ly.sliding ? Ly.attn_norm : Ly.k_in_norm,
@@ -2845,7 +2865,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                     gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * TC, msg + (size_t) j * TC, Ly.lp_down[j],
                              Ly.lp_forget[j], Ly.lp_gain[j], x3[j], {Ly.lp_bf[j][0], Ly.lp_bf[j][1], Ly.lp_bf[j][2]}};
                 k::loop_gates(gt, 3, T, C, c.rank, 1e-6f, W.lp_g, g_s);
-                for (int j = 0; j < 3; ++j) k::rms_f16(x3[j], nw[j], T, C, c.eps, y16[j], x3[j], g_s);
+                k::rms_multi_f16(k::RmsF16Jobs{{x3[0], x3[1], x3[2]}, {nw[0], nw[1], nw[2]}, {y16[0], y16[1], y16[2]}, {x3[0], x3[1], x3[2]}},
+                                 3, T, C, c.eps, g_s);
                 sep = true;
             } else if (l > 0) {
                 k::RmsOuts outs{};
@@ -2855,6 +2876,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                 for (int j = 0; j < (sep ? 3 : 1); ++j) k::rms_f16(W.h, nw[j], T, C, c.eps, y16[j], x3[j], g_s);
             }
         }
+        g_fprof.pend(0, true);
+        g_fprof.pstart(true);
         // the projections (the tensor cores), the k and v short convs (their histories and inputs recorded)
         float *q_p, *r_p, *gate_p;
         int q_ld, r_ld, gate_ld;
@@ -2865,49 +2888,18 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             q_ld = r_ld = gate_ld = N;
             if (!sep) {
                 tile_rows(m, 0, N, W.x16, T, W.qkv, N);
-                if (par_stream_on()) {
-                    ensure_par_streams();
-                    CU(cudaEventRecord(g_ev_fork, g_s));
-                    CU(cudaStreamWaitEvent(g_s2, g_ev_fork, 0));
-                    k::conv_block(W.qkv + HD, N, Ly.h_k, Ly.sc_k, nullptr, 0, 0, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
-                                  Ly.rec_x[0], g_s);
-                    k::conv_block(W.qkv + HD + KD, N, Ly.h_v, Ly.sc_v, nullptr, 0, 0, T, KD, nullptr, 0, W.vconv, KD,
-                                  Ly.rec_old[1], Ly.rec_x[1], g_s2);
-                    CU(cudaEventRecord(g_ev_j2, g_s2));
-                    CU(cudaStreamWaitEvent(g_s, g_ev_j2, 0));
-                } else {
-                    k::conv_block(W.qkv + HD, N, Ly.h_k, Ly.sc_k, nullptr, 0, 0, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
-                                  Ly.rec_x[0], g_s);
-                    k::conv_block(W.qkv + HD + KD, N, Ly.h_v, Ly.sc_v, nullptr, 0, 0, T, KD, nullptr, 0, W.vconv, KD,
-                                  Ly.rec_old[1], Ly.rec_x[1], g_s);
-                }
-            } else if (par_stream_on()) {
-                ensure_par_streams();
-                CU(cudaEventRecord(g_ev_fork, g_s));
-                CU(cudaStreamWaitEvent(g_s2, g_ev_fork, 0));
-                CU(cudaStreamWaitEvent(g_s3, g_ev_fork, 0));
-                tile_rows(m, 0, HD, W.x16, T, W.qkv, N, g_s);
-                tile_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.x16, T, W.qkv + HD + 2 * KD, N, g_s);
-                tile_rows(m, HD, KD, W.xk16, T, W.qkv + HD, N, g_s2);
-                k::conv_block(W.qkv + HD, N, Ly.h_k, Ly.sc_k, nullptr, 0, 0, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
-                              Ly.rec_x[0], g_s2);
-                CU(cudaEventRecord(g_ev_j2, g_s2));
-                tile_rows(m, HD + KD, KD, W.xv16, T, W.qkv + HD + KD, N, g_s3);
-                k::conv_block(W.qkv + HD + KD, N, Ly.h_v, Ly.sc_v, nullptr, 0, 0, T, KD, nullptr, 0, W.vconv, KD,
-                              Ly.rec_old[1], Ly.rec_x[1], g_s3);
-                CU(cudaEventRecord(g_ev_j3, g_s3));
-                CU(cudaStreamWaitEvent(g_s, g_ev_j2, 0));
-                CU(cudaStreamWaitEvent(g_s, g_ev_j3, 0));
+            } else if ((HD & 15) == 0 && (KD & 15) == 0) {
+                // Fused Q/K/V/RG with per-range inputs in one launch!
+                tile_rows(m, 0, N, W.x16, T, W.qkv, N, g_s, k::MvAlt16{W.xk16, HD, KD}, k::MvAlt16{W.xv16, HD + KD, KD});
             } else {
                 tile_rows(m, 0, HD, W.x16, T, W.qkv, N, g_s);
                 tile_rows(m, HD, KD, W.xk16, T, W.qkv + HD, N, g_s);
                 tile_rows(m, HD + KD, KD, W.xv16, T, W.qkv + HD + KD, N, g_s);
                 tile_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.x16, T, W.qkv + HD + 2 * KD, N, g_s);
-                k::conv_block(W.qkv + HD, N, Ly.h_k, Ly.sc_k, nullptr, 0, 0, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
-                              Ly.rec_x[0], g_s);
-                k::conv_block(W.qkv + HD + KD, N, Ly.h_v, Ly.sc_v, nullptr, 0, 0, T, KD, nullptr, 0, W.vconv, KD,
-                              Ly.rec_old[1], Ly.rec_x[1], g_s);
             }
+            k::conv_block_kv(W.qkv + HD, N, Ly.h_k, Ly.sc_k, nullptr, 0, 0, W.kconv, KD, Ly.rec_old[0], Ly.rec_x[0],
+                             W.qkv + HD + KD, N, Ly.h_v, Ly.sc_v, nullptr, 0, 0, W.vconv, KD, Ly.rec_old[1], Ly.rec_x[1],
+                             T, KD, g_s);
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
             const int N = m.N;
@@ -2937,15 +2929,16 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                 tile_rows(m, 0, N, W.x16, T, W.qkv, N, g_s);
                 k::mv_f16_rows(Ly.sc_k_dyn16, DL, C, W.xk, C, T, kd, DL, g_s);
                 tile_rows(Ly.wk, 0, KD, W.xk16, T, W.kk, KD, g_s);
-                k::conv_block(W.kk, KD, Ly.h_k, Ly.sc_k, kd, DL, c.KV, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
-                              Ly.rec_x[0], g_s);
                 k::mv_f16_rows(Ly.sc_v_dyn16, DL, C, W.xv, C, T, vd, DL, g_s);
                 tile_rows(Ly.wv, 0, KD, W.xv16, T, W.vv, KD, g_s);
-                k::conv_block(W.vv, KD, Ly.h_v, Ly.sc_v, vd, DL, c.KV, T, KD, nullptr, 0, W.vconv, KD, Ly.rec_old[1],
-                              Ly.rec_x[1], g_s);
+                k::conv_block_kv(W.kk, KD, Ly.h_k, Ly.sc_k, kd, DL, c.KV, W.kconv, KD, Ly.rec_old[0], Ly.rec_x[0],
+                                 W.vv, KD, Ly.h_v, Ly.sc_v, vd, DL, c.KV, W.vconv, KD, Ly.rec_old[1], Ly.rec_x[1],
+                                 T, KD, g_s);
             }
         }
         // the clips, the window's K and V into the cache at its positions, the attention of its queries
+        g_fprof.pend(1, true);
+        g_fprof.pstart(true);
         const int extent = Ly.sliding ? c.extent_swa : c.extent;
         const int window = Ly.sliding ? c.window : (1 << 30);
         const int ring = Ly.sliding ? Ly.kv_cap : 0;
@@ -2966,13 +2959,17 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                               Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, gate_ld, W.x16, g_s);
         }
         // the output projection and its short conv (the stream added, but where a block starts)
+        g_fprof.pend(2, true);
+        g_fprof.pstart(true);
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
         k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first ? nullptr : W.h, C, W.r, C,
                       Ly.rec_old[2], Ly.rec_x[2], g_s);
         if (first) ++nb;
+        g_fprof.pend(3, true);
         // the MoE: its input, the router, the picks grouped by expert on the device, the experts
+        g_fprof.pstart(true);
         {
             k::ResStates st{};
             for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
@@ -2992,24 +2989,23 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         const bool use_limbs = k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F) ||
                                (Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0 && C % 32 == 0 && c.F % 32 == 0);
         uint16_t* limbs = (uint16_t*) W.gu32;
-        if (use_limbs && par_stream_on()) {
-            ensure_par_streams();
-            CU(cudaEventRecord(g_ev_fork, g_s));
-            CU(cudaStreamWaitEvent(g_s2, g_ev_fork, 0));
-            k::f16_limbs_rows(W.xq, T, C, limbs, g_s2);
-            CU(cudaEventRecord(g_ev_j2, g_s2));
-        }
         k::mv_f16_rows(Ly.router16, c.E, C, W.xq, C, T, W.rlog, c.E, g_s);
-        int* rtop = W.route_d;
-        float* rw = (float*) (W.route_d + S);
-        k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
-        k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
-                       g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
-        if (use_limbs) {
-            if (par_stream_on()) CU(cudaStreamWaitEvent(g_s, g_ev_j2, 0));
-            else k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
+        if (c.E <= 128 && S <= 64) {
+            k::route_group_block(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
+                                 Ly.tab_sc[2], g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt,
+                                 g_blk.inv, W.xq, C, use_limbs ? limbs : nullptr, g_s);
+        } else {
+            int* rtop = W.route_d;
+            float* rw = (float*) (W.route_d + S);
+            k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+            k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
+                           g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
+            if (use_limbs) k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
         }
-        if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
+        g_fprof.pend(4, true);
+        g_fprof.pstart(true);
+        const bool is_nv = k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
+        if (is_nv) {
             k::experts_block_gu(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, T, Ly.eb[0], C, c.F, limbs, g_blk.sg,
                                 g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
             k::experts_block_down(g_blk.blob, g_blk.n, g_blk.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
@@ -3023,11 +3019,15 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                               g_s);
         }
+        g_fprof.pend(is_nv ? 5 : 6, true);
+        g_fprof.pstart(true);
         k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
         k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
                       g_s);
+        g_fprof.pend(7, true);
     }
     if (out_mode == OutMode::kNone) return;
+    g_fprof.pstart(true);
     {   // the head: every token's logits
         k::ResStates st{};
         for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
@@ -3055,36 +3055,57 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                                    (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
         }
     }
+    g_fprof.pend(8, true);
 }
 
 // The window tok [T] at positions pos0 .. pos0 + T - 1 through the block path: argmax_out [T] (kArgmax) or logits_out
 // [T][n_vocab] appended (kLogits).  The convs' records then hold the window (block_rollback takes it back).
 void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std::vector<float>& logits_out,
                 std::vector<int>* argmax_out) {
+    g_fprof.init();
     const Config& c = M.c;
     if (T < 1 || T > kBlockMax) die("fast_block: a window of 1 .. 8 tokens");
     if (!g_blk.ready) block_init(M);
     Work& W = dev_work(0);
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
+    const double tw0 = now();
     for (int t = 0; t < T; ++t) {
         k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_blk.emb_h + (size_t) t * c.C);
         g_blk.pos_h[t] = pos0 + t;
     }
     g_last_captured = false;
     if (!g_graph) {
+        if (g_fprof.block_on) { g_fprof.begin_capture(); CU(cudaEventRecord(g_fprof.ev0, g_s)); }
         fast_block_launches(M, W, T, out_mode);
+        if (g_fprof.block_on) { CU(cudaEventRecord(g_fprof.ev1, g_s)); g_fprof.end_capture(); }
     } else {
         FastGraph& G = g_bgraph[T][(int) out_mode];
         if (!G.exec) {
             g_last_captured = true;
+            if (g_fprof.block_on) g_fprof.begin_capture();
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
             fast_block_launches(M, W, T, out_mode);
             CU(cudaStreamEndCapture(g_s, &G.graph));
+            if (g_fprof.block_on) g_fprof.end_capture();
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
+        if (g_fprof.block_on) CU(cudaEventRecord(g_fprof.ev0, g_s));
         CU(cudaGraphLaunch(G.exec, g_s));
+        if (g_fprof.block_on) CU(cudaEventRecord(g_fprof.ev1, g_s));
     }
     CU(cudaStreamSynchronize(g_s));
+    if (g_fprof.block_on) {
+        const double wms = (now() - tw0) * 1000.0;
+        float gms = 0;
+        CU(cudaEventElapsedTime(&gms, g_fprof.ev0, g_fprof.ev1));
+        if (!g_last_captured) {
+            g_fprof.wall_ms += wms;
+            g_fprof.gpu_ms += gms;
+            g_fprof.collect(true);
+            ++g_fprof.calls;
+            if (g_fprof.calls == 50) g_fprof.dump("fast_block_graph_prof", 50);
+        }
+    }
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(W.argmax_h, W.argmax_h + T);
     } else if (out_mode == OutMode::kLogits) {
@@ -3164,12 +3185,12 @@ int sample_from(const std::vector<std::pair<int, double>>& d, std::mt19937_64& r
 struct SpecCtl {
     int wmax = 8;
     bool adapt = true;
-    double c_plain = 7.8e-3, c[kBlockMax + 1] = {};
-    double prior[kBlockMax + 1] = {0, 7.8e-3, 13.3e-3, 15.1e-3, 16.7e-3, 18.2e-3, 19.8e-3, 21.3e-3, 22.8e-3};
+    double c_plain = 5.3e-3, c[kBlockMax + 1] = {};
+    double prior[kBlockMax + 1] = {0, 5.3e-3, 8.0e-3, 8.6e-3, 9.2e-3, 9.9e-3, 10.6e-3, 11.2e-3, 11.8e-3};
     bool seen_plain = false, seen[kBlockMax + 1] = {};
     double S = 1, F = 1;   // (the drafts accepted, the ones rejected: decayed counts)
     int plain_run = 0;
-    int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 8;   // plain tokens before a look
+    int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 2;   // plain tokens before a look
     int probe_w = 4;
     double decay = getenv("IK2_DRAFT_DECAY") ? atof(getenv("IK2_DRAFT_DECAY")) : 0.85;
     uint64_t steps = 0, plain = 0, drafted = 0, accepted = 0;
@@ -3235,7 +3256,8 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     embed_row(M, anchor, raw, anchor_h);
     const double t1 = spec_prof ? now() : 0.0;
     int dr[kBlockMax];
-    ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1);
+    bool draft_cap = false;
+    ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1, &draft_cap);
     const double t2 = spec_prof ? now() : 0.0;
     int tk[kBlockMax];
     tk[0] = anchor;
@@ -3245,6 +3267,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     if (sc.temp <= 0) {
         std::vector<int> g;
         fast_block(M, tk, B, P, OutMode::kArgmax, lo, &g);
+        g_last_captured = g_last_captured || draft_cap;
         int n = 0;
         while (n < B - 1 && dr[n] == g[n]) ++n;
         for (int j = 0; j < n; ++j) next.push_back(dr[j]);
@@ -3253,6 +3276,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         // the drafts are the drafter's argmax (a point mass): accept draft d with the target's probability of it,
         // else sample the target's distribution without d - the target's distribution exactly
         fast_block(M, tk, B, P, OutMode::kCand, lo, nullptr);
+        g_last_captured = g_last_captured || draft_cap;
         for (int j = 0; j < B; ++j) {
             std::vector<std::pair<float, int>> cd;
             if (!block_cands(M, j, cd)) {   // (more candidates than kept: the row's logits)
@@ -3286,8 +3310,9 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         }
     const int m = (int) next.size();   // (the anchor and next[0 .. m - 2] are kept: m positions)
     if (m < B) block_rollback(m);
-    ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, m, P);
-    ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
+    bool ctx_cap = false;
+    ik2::draft::commit_context(drafter, g_taps, g_taps_ld, m, P, &ctx_cap);
+    g_last_captured = g_last_captured || ctx_cap;
     if (spec_prof) {
         const double t4 = now();
         if (!g_last_captured) {

@@ -384,6 +384,13 @@ void draft_attn(const float* q, const float* kc, const float* vc, int k_lo, int 
 void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int k_lo, int k_hi, const float* kb,
                     const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
                     int cap);
+/// Graph-capturable variants reading k_hi from device pointer pos_d (k_lo = max(0, k_hi - win)) with fixed S splits.
+void draft_attn_at(const float* q, const float* kc, const float* vc, const int* pos_d, int win, int S, const float* kb,
+                   const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
+                   int cap);
+void draft_attn_f16_at(const float* q, const uint16_t* kc, const uint16_t* vc, const int* pos_d, int win, int S,
+                       const float* kb, const float* vb, int nq, int H, int Hkv, float scale, float* scratch,
+                       float* out, cudaStream_t s, int cap);
 /// out [T][F] BF16 = silu(gu[t][f]) * gu[t][F + f] (gu [T][2 F] F32: gate's then up's).
 void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s);
 /// The Markov head's input [state (R); emb[prev] (R, BF16 table); hidden (C); f (C)] as BF16 into out [2 R + 2 C].

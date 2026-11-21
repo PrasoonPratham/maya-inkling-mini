@@ -21,7 +21,7 @@ add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zi>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Z7>)
   add_link_options(/DEBUG /OPT:REF /OPT:ICF)
 endif()
 
@@ -891,6 +891,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         set(_ik2_filter OFF)   # ("all" / "all-major": as CMake gives them)
       elseif(_base STREQUAL "90")
         list(APPEND _ik2_archs "90a")
+      elseif(_base STREQUAL "120")
+        list(APPEND _ik2_archs "120a")
       elseif(NOT _base LESS 80)
         list(APPEND _ik2_archs "${_a}")
       endif()

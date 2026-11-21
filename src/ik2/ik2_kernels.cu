@@ -2778,19 +2778,35 @@ __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, 
 // nibbles values 2 m + 8, 2 m + 9 in slots 2 t + 8, 2 t + 9).  B: the input in FP16 where it is, the same in all
 // eight columns.  A code times its sub-block's scale is exact in FP16 (a code is at most 12, ue4m3 at most 240 and
 // at least 2^-10); the sum is the tensor cores' FP32.
-__device__ __forceinline__ uint32_t ue4m3_h2(uint32_t x) {   // FP16 bits of ue4m3(x) in both halves
+__device__ __forceinline__ uint32_t ue4m3_h2(uint32_t x) {   // FP16 bits of ue4m3(x) in both halves (2x on sm_120a for native e2m1)
     const uint32_t e = (x >> 3) & 15u, m = x & 7u;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    const uint32_t sub = __byte_perm(0x1e1c1800u, 0x23222120u, m) << 8;   // m 2^-9
+    uint32_t h = e ? (((e + 8u) << 10) | (m << 7)) : sub;
+#else
     const uint32_t sub = __byte_perm(0x1a181400u, 0x1f1e1d1cu, m) << 8;   // m 2^-10
     uint32_t h = e ? (((e + 7u) << 10) | (m << 7)) : sub;
+#endif
     h = (x == 0x7Fu) ? 0u : h;
     return h | (h << 16);
 }
 __device__ __forceinline__ uint32_t nv_pair_h2(uint32_t s, uint32_t scale) {   // bytes 0 and 1's low nibbles
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    const uint16_t packed = (uint16_t) ((s & 0x000Fu) | ((s >> 4) & 0x00F0u));
+    uint32_t h2, r;
+    asm("{ .reg .b8 b0, b1;\n"
+        "  mov.b16 {b0, b1}, %1;\n"
+        "  cvt.rn.f16x2.e2m1x2 %0, b0; }\n"
+        : "=r"(h2) : "h"(packed));
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(h2), "r"(scale));
+    return r;
+#else
     const uint32_t mag = __byte_perm(0x42403c00u, 0x4a484644u, (s & 0x0707u) << 4);
     const uint32_t sign = ((s & 0x0808u) * 0x101000u) & 0x80008000u;
     uint32_t r;
     asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(mag | sign), "r"(scale));
     return r;
+#endif
 }
 struct NvStep {   // a lane's part of a 64-value block of its two rows: the sub-block's scales and codes
     uint32_t sa, sb, wa0, wa1, wb0, wb1;
@@ -3739,28 +3755,47 @@ __device__ __forceinline__ bool mv_conv_row(const MvConv& cv, int row, float x_n
 // both 16-wide MMA instructions. Packing the signed bytes via 1024+u is exact
 // for all 256 inputs; the product rounds to half as in decode_q8p_f16_kernel.
 template <int Splits>
-__global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int K, const uint16_t* x, int T, float* out,
-                            int ldy) {
-    const int lane = threadIdx.x % 32, split = threadIdx.x / 32, g = lane / 4, t = lane % 4;
+__global__ void __launch_bounds__(Splits * 32)
+q8_mma_tile(const int8_t* __restrict__ q, const uint16_t* __restrict__ scales, int N, int K,
+            const uint16_t* __restrict__ x, int T, float* __restrict__ out, int ldy) {
+    const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
     const int row = 16 * blockIdx.x + g, token = 8 * blockIdx.y + g;
     const int row0 = min(row, N - 1), row1 = min(row + 8, N - 1);
-    const int blocks = K / 32;
+    const int blocks = K >> 5;
+    const int8_t* q0 = q + (size_t)row0 * K + t * 8;
+    const int8_t* q1 = q + (size_t)row1 * K + t * 8;
+    const uint16_t* sc0 = scales + (size_t)row0 * blocks;
+    const uint16_t* sc1 = scales + (size_t)row1 * blocks;
+    const uint16_t* xp = x + (size_t)min(token, T - 1) * K + t * 8;
     float acc[4] = {};
-    for (int i = split; i < blocks; i += Splits) {
-        const int col = i * 32 + t * 8;
-        const uint2 a0 = *(const uint2*)(q + (size_t)row0 * K + col);
-        const uint2 a1 = *(const uint2*)(q + (size_t)row1 * K + col);
-        uint32_t s0 = scales[(size_t)row0 * blocks + i], s1 = scales[(size_t)row1 * blocks + i];
-        s0 |= s0 << 16;
-        s1 |= s1 << 16;
-        const uint4 v = *(const uint4*)(x + (size_t)min(token, T - 1) * K + col);
-        uint32_t a[4] = {q8_h2(a0.x, s0), q8_h2(a1.x, s1), q8_h2(a0.y, s0), q8_h2(a1.y, s1)};
-        mma16816(acc, a, v.x, v.z);
-        a[0] = q8_h2(a0.x >> 16, s0);
-        a[1] = q8_h2(a1.x >> 16, s1);
-        a[2] = q8_h2(a0.y >> 16, s0);
-        a[3] = q8_h2(a1.y >> 16, s1);
-        mma16816(acc, a, v.y, v.w);
+    if (split < blocks) {
+        uint2 a0 = __ldg((const uint2*)(q0 + split * 32));
+        uint2 a1 = __ldg((const uint2*)(q1 + split * 32));
+        uint32_t s0 = __ldg(sc0 + split), s1 = __ldg(sc1 + split);
+        uint4 v = __ldg((const uint4*)(xp + split * 32));
+        for (int i = split; i < blocks; i += Splits) {
+            uint2 na0 = a0, na1 = a1;
+            uint32_t ns0 = s0, ns1 = s1;
+            uint4 nv = v;
+            if (i + Splits < blocks) {
+                const int ni = i + Splits;
+                na0 = __ldg((const uint2*)(q0 + ni * 32));
+                na1 = __ldg((const uint2*)(q1 + ni * 32));
+                ns0 = __ldg(sc0 + ni);
+                ns1 = __ldg(sc1 + ni);
+                nv = __ldg((const uint4*)(xp + ni * 32));
+            }
+            s0 |= s0 << 16;
+            s1 |= s1 << 16;
+            uint32_t a[4] = {q8_h2(a0.x, s0), q8_h2(a1.x, s1), q8_h2(a0.y, s0), q8_h2(a1.y, s1)};
+            mma16816(acc, a, v.x, v.z);
+            a[0] = q8_h2(a0.x >> 16, s0);
+            a[1] = q8_h2(a1.x >> 16, s1);
+            a[2] = q8_h2(a0.y >> 16, s0);
+            a[3] = q8_h2(a1.y >> 16, s1);
+            mma16816(acc, a, v.y, v.w);
+            a0 = na0, a1 = na1, s0 = ns0, s1 = ns1, v = nv;
+        }
     }
     __shared__ float4 part[Splits][32];
     part[split][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
@@ -3956,13 +3991,19 @@ __device__ __forceinline__ float ld_f(const uint16_t* p) { return h2f(*p); }
 template <class KVT>
 __global__ void draft_attn_part_kernel(const float* q, const KVT* kc, const KVT* vc, int k_lo, int k_hi,
                                        const float* kb, const float* vb, int nq, int H, int Hkv, float scale, int per,
-                                       float* lgs, float* part_o, float2* part_ml, int cap) {
+                                       float* lgs, float* part_o, float2* part_ml, int cap,
+                                       const int* pos_d = nullptr, int win = 0) {
     __shared__ float sh[128];
     __shared__ float qs[kDraftQ][128];
     __shared__ float mrow[kDraftQ];
     const int h = blockIdx.x, sp = blockIdx.y, S = gridDim.y, g = h / (H / Hkv), tid = threadIdx.x, lane = tid & 31,
               warp = tid >> 5;
+    if (pos_d) {
+        k_hi = *pos_d;
+        k_lo = max(0, k_hi - win);
+    }
     const int KD = Hkv * 128, nc = k_hi - k_lo, nk = nc + nq;
+    if (pos_d) per = (nk + S - 1) / S;
     const int j0 = min(nk, sp * per), j1 = min(nk, j0 + per), n = j1 - j0;
     for (int qi = 0; qi < nq; ++qi) qs[qi][tid] = q[((size_t) qi * H + h) * 128 + tid];
     __syncthreads();
@@ -4170,9 +4211,63 @@ __global__ void argmax_gemv_f16_part_kernel(const uint16_t* W, int ld, const flo
     const int gstride = gridDim.x * blockDim.x;
     float best = -INFINITY;
     int idx = 0x7fffffff;
+    const bool vec8 = (((uintptr_t) W & 15) == 0) && ((ld & 7) == 0) &&
+                      (!base || ((uintptr_t) base & 15) == 0) && (!bias_f16 || ((uintptr_t) bias_f16 & 15) == 0);
     const bool vec4 = (((uintptr_t) W & 7) == 0) && ((ld & 3) == 0) &&
                       (!base || ((uintptr_t) base & 15) == 0) && (!bias_f16 || ((uintptr_t) bias_f16 & 7) == 0);
-    if (vec4) {
+    if (vec8) {
+        const int n8 = n >> 3;
+        for (int v8 = gtid; v8 < n8; v8 += gstride) {
+            const int v = v8 << 3;
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            float d4 = 0.0f, d5 = 0.0f, d6 = 0.0f, d7 = 0.0f;
+            const uint16_t* wr = W + v;
+            for (int r = 0; r < R; ++r, wr += ld) {
+                const float xr = use_smem ? sx[r] : __ldg(x + r);
+                const uint4 w8 = __ldg((const uint4*) wr);
+                const float2 f0 = u32_to_f2(w8.x), f1 = u32_to_f2(w8.y);
+                const float2 f2 = u32_to_f2(w8.z), f3 = u32_to_f2(w8.w);
+                d0 = fmaf(f0.x, xr, d0);
+                d1 = fmaf(f0.y, xr, d1);
+                d2 = fmaf(f1.x, xr, d2);
+                d3 = fmaf(f1.y, xr, d3);
+                d4 = fmaf(f2.x, xr, d4);
+                d5 = fmaf(f2.y, xr, d5);
+                d6 = fmaf(f3.x, xr, d6);
+                d7 = fmaf(f3.y, xr, d7);
+            }
+            if (base) {
+                const float4 bs0 = __ldg((const float4*) (base + v));
+                const float4 bs1 = __ldg((const float4*) (base + v + 4));
+                d0 += bs0.x, d1 += bs0.y, d2 += bs0.z, d3 += bs0.w;
+                d4 += bs1.x, d5 += bs1.y, d6 += bs1.z, d7 += bs1.w;
+            }
+            if (bias_f16) {
+                const uint4 b8 = __ldg((const uint4*) (bias_f16 + v));
+                const float2 f0 = u32_to_f2(b8.x), f1 = u32_to_f2(b8.y);
+                const float2 f2 = u32_to_f2(b8.z), f3 = u32_to_f2(b8.w);
+                d0 += f0.x, d1 += f0.y, d2 += f1.x, d3 += f1.y;
+                d4 += f2.x, d5 += f2.y, d6 += f3.x, d7 += f3.y;
+            }
+            argmax_better(d0, v + 0, best, idx);
+            argmax_better(d1, v + 1, best, idx);
+            argmax_better(d2, v + 2, best, idx);
+            argmax_better(d3, v + 3, best, idx);
+            argmax_better(d4, v + 4, best, idx);
+            argmax_better(d5, v + 5, best, idx);
+            argmax_better(d6, v + 6, best, idx);
+            argmax_better(d7, v + 7, best, idx);
+        }
+        for (int v = (n8 << 3) + gtid; v < n; v += gstride) {
+            float d = 0.0f;
+            const uint16_t* wr = W + v;
+            for (int r = 0; r < R; ++r, wr += ld)
+                d = fmaf(h2f(__ldg(wr)), use_smem ? sx[r] : __ldg(x + r), d);
+            if (base) d += __ldg(base + v);
+            if (bias_f16) d += h2f(__ldg(bias_f16 + v));
+            argmax_better(d, v, best, idx);
+        }
+    } else if (vec4) {
         const int n4 = n >> 2;
         for (int v4 = gtid; v4 < n4; v4 += gstride) {
             const int v = v4 << 2;
@@ -4843,20 +4938,24 @@ experts_block_gu_kernel(const uint8_t* const* __restrict__ blob, const int* __re
         }
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
-            uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
-            if (x_ok[j]) x0 = __ldg(xp[j] + k * 8), x1 = __ldg(xp[j] + k * 8 + 1);
-            const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+            if (j == 0 || n > 4) {
+                uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
+                if (x_ok[j]) x0 = __ldg(xp[j] + k * 8), x1 = __ldg(xp[j] + k * 8 + 1);
+                const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 #pragma unroll
-            for (int m = 0; m < 4; ++m) mma16816(v[j], af[m], xx[m], xx[4 + m]);
+                for (int m = 0; m < 4; ++m) mma16816(v[j], af[m], xx[m], xx[4 + m]);
+            }
         }
         cur = nxt;
     }
 #pragma unroll
-    for (int j = 0; j < NT; ++j) part[split][j][lane] = make_float4(v[j][0], v[j][1], v[j][2], v[j][3]);
+    for (int j = 0; j < NT; ++j)
+        if (j == 0 || n > 4) part[split][j][lane] = make_float4(v[j][0], v[j][1], v[j][2], v[j][3]);
     __syncthreads();
     if (split) return;
 #pragma unroll
     for (int j = 0; j < NT; ++j) {
+        if (j > 0 && n <= 4) break;
         float4 tot = part[0][j][lane];
 #pragma unroll
         for (int s = 1; s < SPLIT; ++s) {
@@ -5017,21 +5116,25 @@ experts_block_gu_q8_kernel(const uint8_t* const* __restrict__ blob, const int* _
         const uint32_t af1[4] = {q8_pair(cur.a[2]), q8_pair(cur.b[2]), q8_pair(cur.a[3]), q8_pair(cur.b[3])};
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
-            uint4 x = make_uint4(0, 0, 0, 0);
-            if (x_ok[j]) x = __ldg(xp[j] + k * 4);
-            float bs[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            mma16816(bs, af0, x.x, x.y);
-            mma16816(bs, af1, x.z, x.w);
-            v[j][0] += sa * bs[0], v[j][1] += sa * bs[1], v[j][2] += sb * bs[2], v[j][3] += sb * bs[3];
+            if (j == 0 || n > 4) {
+                uint4 x = make_uint4(0, 0, 0, 0);
+                if (x_ok[j]) x = __ldg(xp[j] + k * 4);
+                float bs[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                mma16816(bs, af0, x.x, x.y);
+                mma16816(bs, af1, x.z, x.w);
+                v[j][0] += sa * bs[0], v[j][1] += sa * bs[1], v[j][2] += sb * bs[2], v[j][3] += sb * bs[3];
+            }
         }
         cur = nxt;
     }
 #pragma unroll
-    for (int j = 0; j < NT; ++j) part[split][j][lane] = make_float4(v[j][0], v[j][1], v[j][2], v[j][3]);
+    for (int j = 0; j < NT; ++j)
+        if (j == 0 || n > 4) part[split][j][lane] = make_float4(v[j][0], v[j][1], v[j][2], v[j][3]);
     __syncthreads();
     if (split) return;
 #pragma unroll
     for (int j = 0; j < NT; ++j) {
+        if (j > 0 && n <= 4) break;
         float4 tot = part[0][j][lane];
 #pragma unroll
         for (int s = 1; s < SPLIT; ++s) {
@@ -5511,6 +5614,34 @@ void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int 
                     int cap) {
     draft_attn_impl<uint16_t>(q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap);
 }
+template <class KVT>
+static void draft_attn_at_impl(const float* q, const KVT* kc, const KVT* vc, const int* pos_d, int win, int S,
+                               const float* kb, const float* vb, int nq, int H, int Hkv, float scale, float* scratch,
+                               float* out, cudaStream_t s, int cap) {
+    if (nq > kDraftQ || S < 1 || S > 64) {
+        std::fprintf(stderr, "ik2::k::draft_attn_at: nq=%d S=%d\n", nq, S);
+        std::abort();
+    }
+    // Place fixed-size part_o and part_ml first so lgs sits at a static offset independent of dynamic per.
+    float* part_o = scratch;
+    float2* part_ml = (float2*) (part_o + (size_t) S * H * kDraftQ * 128);
+    float* lgs = (float*) (part_ml + (size_t) S * H * kDraftQ);
+    draft_attn_part_kernel<KVT><<<dim3((unsigned) H, (unsigned) S), 128, 0, s>>>(
+        q, kc, vc, 0, 0, kb, vb, nq, H, Hkv, scale, 0, lgs, part_o, part_ml, cap > 0 ? cap : (1 << 30), pos_d, win);
+    check("draft_attn_at (chunks)");
+    draft_attn_merge_kernel<<<dim3((unsigned) H, (unsigned) nq), 128, 0, s>>>(part_o, part_ml, S, H, out);
+    check("draft_attn_at (merge)");
+}
+void draft_attn_at(const float* q, const float* kc, const float* vc, const int* pos_d, int win, int S, const float* kb,
+                   const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
+                   int cap) {
+    draft_attn_at_impl<float>(q, kc, vc, pos_d, win, S, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap);
+}
+void draft_attn_f16_at(const float* q, const uint16_t* kc, const uint16_t* vc, const int* pos_d, int win, int S,
+                       const float* kb, const float* vb, int nq, int H, int Hkv, float scale, float* scratch,
+                       float* out, cudaStream_t s, int cap) {
+    draft_attn_at_impl<uint16_t>(q, kc, vc, pos_d, win, S, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap);
+}
 void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s) {
     silu_mul_bf16_kernel<<<grid((size_t) T * F), kBlk, 0, s>>>(gu, T, F, out);
     check("silu_mul_bf16");
@@ -5554,8 +5685,10 @@ void argmax_rows(const float* x, int ld, int n_rows, int n_cols, int* out, cudaS
 void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* base, const uint16_t* bias_f16,
                      int R, int n, int* out, cudaStream_t s) {
     if (n <= 0) return;
-    const int n4 = std::max(1, n >> 2);
-    const int B = std::min(512, std::max(1, (n4 + 127) / 128));
+    const bool vec8 = (((uintptr_t) W & 15) == 0) && ((ld & 7) == 0) &&
+                      (!base || ((uintptr_t) base & 15) == 0) && (!bias_f16 || ((uintptr_t) bias_f16 & 15) == 0);
+    const int nv = std::max(1, vec8 ? (n >> 3) : (n >> 2));
+    const int B = std::min(512, std::max(1, (nv + 127) / 128));
     const bool use_smem = R <= 4096;
     const size_t smem = use_smem ? (size_t) R * sizeof(float) : 0;
     if (B == 1) {
@@ -5886,7 +6019,14 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
 
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s) {
-    q8_mma_tile<4><<<dim3((N + 15) / 16, (T + 7) / 8), 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
+    static const int sp_small = getenv("IK2_Q8_TILE_SMALL") ? atoi(getenv("IK2_Q8_TILE_SMALL")) : 8;
+    const dim3 g((N + 15) / 16, (T + 7) / 8);
+    if (N <= 4096 && sp_small == 8)
+        q8_mma_tile<8><<<g, 256, 0, s>>>(q, d, N, K, x, T, y, ldy);
+    else if (N <= 4096 && sp_small == 6)
+        q8_mma_tile<6><<<g, 192, 0, s>>>(q, d, N, K, x, T, y, ldy);
+    else
+        q8_mma_tile<4><<<g, 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
     check("q8_mma_tile");
 }
 
@@ -6192,16 +6332,25 @@ void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, 
                       size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su, float gcap,
                       float ucap, uint16_t* h, cudaStream_t s) {
     if (G <= 0) return;
+    static const int sp = getenv("IK2_BLOCK_GU_SPLIT") ? atoi(getenv("IK2_BLOCK_GU_SPLIT")) : 8;
     const dim3 g((unsigned) (F / 8), (unsigned) G);
-    if (T <= 4) experts_block_gu_kernel<8, 1><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
-    else experts_block_gu_kernel<8, 2><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
+#define IK2_BGU(W) \
+    if (T <= 4) experts_block_gu_kernel<W, 1><<<g, W * 32, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h); \
+    else experts_block_gu_kernel<W, 2><<<g, W * 32, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h)
+    if (sp == 4) { IK2_BGU(4); }
+    else if (sp == 6) { IK2_BGU(6); }
+    else { IK2_BGU(8); }
+#undef IK2_BGU
     check("experts_block_gu");
 }
 void experts_block_down(const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
                         int F, const uint16_t* h, float* y, cudaStream_t s) {
     if (G <= 0) return;
-    experts_block_down_kernel<4><<<dim3((unsigned) (C / 16), (unsigned) G), 128, 0, s>>>(blob, n, row, off_down, C, F,
-                                                                                         h, y);
+    static const int sp = getenv("IK2_BLOCK_DOWN_SPLIT") ? atoi(getenv("IK2_BLOCK_DOWN_SPLIT")) : 4;
+    const dim3 g((unsigned) (C / 16), (unsigned) G);
+    if (sp == 3) experts_block_down_kernel<3><<<g, 96, 0, s>>>(blob, n, row, off_down, C, F, h, y);
+    else if (sp == 6) experts_block_down_kernel<6><<<g, 192, 0, s>>>(blob, n, row, off_down, C, F, h, y);
+    else experts_block_down_kernel<4><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y);
     check("experts_block_down");
 }
 void prep_qkv_r_fp8_block(float* q, int q_ld, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in,

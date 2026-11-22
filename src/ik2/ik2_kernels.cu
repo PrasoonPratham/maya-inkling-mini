@@ -3060,7 +3060,7 @@ __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, 
 // at least 2^-10); the sum is the tensor cores' FP32.
 __device__ __forceinline__ uint32_t ue4m3_h2(uint32_t x) {   // FP16 bits of ue4m3(x) in both halves (2x on sm_120a for native e2m1)
     const uint32_t e = (x >> 3) & 15u, m = x & 7u;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && (defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_SPECIFIC__))
     const uint32_t sub = __byte_perm(0x1e1c1800u, 0x23222120u, m) << 8;   // m 2^-9
     uint32_t h = e ? (((e + 8u) << 10) | (m << 7)) : sub;
 #else
@@ -3071,7 +3071,7 @@ __device__ __forceinline__ uint32_t ue4m3_h2(uint32_t x) {   // FP16 bits of ue4
     return h | (h << 16);
 }
 __device__ __forceinline__ uint32_t nv_pair_h2(uint32_t s, uint32_t scale) {   // bytes 0 and 1's low nibbles
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && (defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_SPECIFIC__))
     const uint16_t packed = (uint16_t) ((s & 0x000Fu) | ((s >> 4) & 0x00F0u));
     uint32_t h2, r;
     asm("{ .reg .b8 b0, b1;\n"
@@ -3118,22 +3118,24 @@ experts_mma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, i
     const uint4* xp = (const uint4*) (x16 + (Gate ? (g == 1 ? (size_t) C : 0) : (size_t) slot * x_ld)) + 2 * t;
     float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const int nk = K / 64;
-    NvStep cur = nv_step_load(a, b, split, t);
-    for (int k = split; k < nk; k += SPLIT) {
-        NvStep nxt = cur;
-        if (k + SPLIT < nk) nxt = nv_step_load(a, b, k + SPLIT, t);
-        const uint32_t sa = ue4m3_h2((cur.sa >> (8 * t)) & 0xFFu), sb = ue4m3_h2((cur.sb >> (8 * t)) & 0xFFu);
-        const uint32_t wa[2] = {cur.wa0, cur.wa1}, wb[2] = {cur.wb0, cur.wb1};
-        const uint4 x0 = __ldg(xp + k * 8), x1 = __ldg(xp + k * 8 + 1);
-        const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+    if (split < nk) {
+        NvStep cur = nv_step_load(a, b, split, t);
+        for (int k = split; k < nk; k += SPLIT) {
+            NvStep nxt = cur;
+            if (k + SPLIT < nk) nxt = nv_step_load(a, b, k + SPLIT, t);
+            const uint32_t sa = ue4m3_h2((cur.sa >> (8 * t)) & 0xFFu), sb = ue4m3_h2((cur.sb >> (8 * t)) & 0xFFu);
+            const uint32_t wa[2] = {cur.wa0, cur.wa1}, wb[2] = {cur.wb0, cur.wb1};
+            const uint4 x0 = __ldg(xp + k * 8), x1 = __ldg(xp + k * 8 + 1);
+            const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 #pragma unroll
-        for (int m = 0; m < 4; ++m) {
-            const uint32_t qa = wa[m >> 1] >> (16 * (m & 1)), qb = wb[m >> 1] >> (16 * (m & 1));
-            const uint32_t af[4] = {nv_pair_h2(qa, sa), nv_pair_h2(qb, sb), nv_pair_h2(qa >> 4, sa),
-                                    nv_pair_h2(qb >> 4, sb)};
-            mma16816(v, af, xx[m], xx[4 + m]);
+            for (int m = 0; m < 4; ++m) {
+                const uint32_t qa = wa[m >> 1] >> (16 * (m & 1)), qb = wb[m >> 1] >> (16 * (m & 1));
+                const uint32_t af[4] = {nv_pair_h2(qa, sa), nv_pair_h2(qb, sb), nv_pair_h2(qa >> 4, sa),
+                                        nv_pair_h2(qb >> 4, sb)};
+                mma16816(v, af, xx[m], xx[4 + m]);
+            }
+            cur = nxt;
         }
-        cur = nxt;
     }
     if (t == 0) part[split][g] = Gate ? make_float2(v[0] + v[1], v[2] + v[3]) : make_float2(v[0], v[2]);
     __syncthreads();
@@ -5422,30 +5424,32 @@ experts_block_gu_kernel(const uint8_t* const* __restrict__ blob, const int* __re
 #pragma unroll
     for (int j = 0; j < NT; ++j) v[j][0] = v[j][1] = v[j][2] = v[j][3] = 0.0f;
     const int nk = C / 64;
-    NvStep cur = nv_step_load(a, b, split, t);
-    for (int k = split; k < nk; k += SPLIT) {
-        NvStep nxt = cur;
-        if (k + SPLIT < nk) nxt = nv_step_load(a, b, k + SPLIT, t);
-        const uint32_t sa = ue4m3_h2((cur.sa >> (8 * t)) & 0xFFu), sb = ue4m3_h2((cur.sb >> (8 * t)) & 0xFFu);
-        const uint32_t wa[2] = {cur.wa0, cur.wa1}, wb[2] = {cur.wb0, cur.wb1};
-        uint32_t af[4][4];
+    if (split < nk) {
+        NvStep cur = nv_step_load(a, b, split, t);
+        for (int k = split; k < nk; k += SPLIT) {
+            NvStep nxt = cur;
+            if (k + SPLIT < nk) nxt = nv_step_load(a, b, k + SPLIT, t);
+            const uint32_t sa = ue4m3_h2((cur.sa >> (8 * t)) & 0xFFu), sb = ue4m3_h2((cur.sb >> (8 * t)) & 0xFFu);
+            const uint32_t wa[2] = {cur.wa0, cur.wa1}, wb[2] = {cur.wb0, cur.wb1};
+            uint32_t af[4][4];
 #pragma unroll
-        for (int m = 0; m < 4; ++m) {
-            const uint32_t qa = wa[m >> 1] >> (16 * (m & 1)), qb = wb[m >> 1] >> (16 * (m & 1));
-            af[m][0] = nv_pair_h2(qa, sa), af[m][1] = nv_pair_h2(qb, sb);
-            af[m][2] = nv_pair_h2(qa >> 4, sa), af[m][3] = nv_pair_h2(qb >> 4, sb);
-        }
-#pragma unroll
-        for (int j = 0; j < NT; ++j) {
-            if (j == 0 || n > 4) {
-                uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
-                if (x_ok[j]) x0 = __ldg(xp[j] + k * 8), x1 = __ldg(xp[j] + k * 8 + 1);
-                const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
-#pragma unroll
-                for (int m = 0; m < 4; ++m) mma16816(v[j], af[m], xx[m], xx[4 + m]);
+            for (int m = 0; m < 4; ++m) {
+                const uint32_t qa = wa[m >> 1] >> (16 * (m & 1)), qb = wb[m >> 1] >> (16 * (m & 1));
+                af[m][0] = nv_pair_h2(qa, sa), af[m][1] = nv_pair_h2(qb, sb);
+                af[m][2] = nv_pair_h2(qa >> 4, sa), af[m][3] = nv_pair_h2(qb >> 4, sb);
             }
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                if (j == 0 || n > 4) {
+                    uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
+                    if (x_ok[j]) x0 = __ldg(xp[j] + k * 8), x1 = __ldg(xp[j] + k * 8 + 1);
+                    const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+                    for (int m = 0; m < 4; ++m) mma16816(v[j], af[m], xx[m], xx[4 + m]);
+                }
+            }
+            cur = nxt;
         }
-        cur = nxt;
     }
 #pragma unroll
     for (int j = 0; j < NT; ++j)
@@ -5487,23 +5491,25 @@ experts_block_down_kernel(const uint8_t* const* __restrict__ blob, const int* __
     const uint4* xp = (const uint4*) (h + (size_t) (x_ok ? row_g[grp * kGroupMax + gr] : 0) * F) + 2 * t;
     float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const int nk = F / 64;
-    NvStep cur = nv_step_load(a, b, split, t);
-    for (int k = split; k < nk; k += SPLIT) {
-        NvStep nxt = cur;
-        if (k + SPLIT < nk) nxt = nv_step_load(a, b, k + SPLIT, t);
-        const uint32_t sa = ue4m3_h2((cur.sa >> (8 * t)) & 0xFFu), sb = ue4m3_h2((cur.sb >> (8 * t)) & 0xFFu);
-        const uint32_t wa[2] = {cur.wa0, cur.wa1}, wb[2] = {cur.wb0, cur.wb1};
-        uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
-        if (x_ok) x0 = __ldg(xp + k * 8), x1 = __ldg(xp + k * 8 + 1);
-        const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+    if (split < nk) {
+        NvStep cur = nv_step_load(a, b, split, t);
+        for (int k = split; k < nk; k += SPLIT) {
+            NvStep nxt = cur;
+            if (k + SPLIT < nk) nxt = nv_step_load(a, b, k + SPLIT, t);
+            const uint32_t sa = ue4m3_h2((cur.sa >> (8 * t)) & 0xFFu), sb = ue4m3_h2((cur.sb >> (8 * t)) & 0xFFu);
+            const uint32_t wa[2] = {cur.wa0, cur.wa1}, wb[2] = {cur.wb0, cur.wb1};
+            uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
+            if (x_ok) x0 = __ldg(xp + k * 8), x1 = __ldg(xp + k * 8 + 1);
+            const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 #pragma unroll
-        for (int m = 0; m < 4; ++m) {
-            const uint32_t qa = wa[m >> 1] >> (16 * (m & 1)), qb = wb[m >> 1] >> (16 * (m & 1));
-            const uint32_t af[4] = {nv_pair_h2(qa, sa), nv_pair_h2(qb, sb), nv_pair_h2(qa >> 4, sa),
-                                    nv_pair_h2(qb >> 4, sb)};
-            mma16816(v, af, xx[m], xx[4 + m]);
+            for (int m = 0; m < 4; ++m) {
+                const uint32_t qa = wa[m >> 1] >> (16 * (m & 1)), qb = wb[m >> 1] >> (16 * (m & 1));
+                const uint32_t af[4] = {nv_pair_h2(qa, sa), nv_pair_h2(qb, sb), nv_pair_h2(qa >> 4, sa),
+                                        nv_pair_h2(qb >> 4, sb)};
+                mma16816(v, af, xx[m], xx[4 + m]);
+            }
+            cur = nxt;
         }
-        cur = nxt;
     }
     part[split][lane] = make_float4(v[0], v[1], v[2], v[3]);
     __syncthreads();
@@ -5606,25 +5612,27 @@ experts_block_gu_q8_kernel(const uint8_t* const* __restrict__ blob, const int* _
 #pragma unroll
     for (int j = 0; j < NT; ++j) v[j][0] = v[j][1] = v[j][2] = v[j][3] = 0.0f;
     const int nk = C / 32;
-    Q8Step cur = q8_step_load(a, b, split, t);
-    for (int k = split; k < nk; k += SPLIT) {
-        Q8Step nxt = cur;
-        if (k + SPLIT < nk) nxt = q8_step_load(a, b, k + SPLIT, t);
-        const float sa = h2f((uint16_t) cur.sa), sb = h2f((uint16_t) cur.sb);
-        const uint32_t af0[4] = {q8_pair(cur.a[0]), q8_pair(cur.b[0]), q8_pair(cur.a[1]), q8_pair(cur.b[1])};
-        const uint32_t af1[4] = {q8_pair(cur.a[2]), q8_pair(cur.b[2]), q8_pair(cur.a[3]), q8_pair(cur.b[3])};
+    if (split < nk) {
+        Q8Step cur = q8_step_load(a, b, split, t);
+        for (int k = split; k < nk; k += SPLIT) {
+            Q8Step nxt = cur;
+            if (k + SPLIT < nk) nxt = q8_step_load(a, b, k + SPLIT, t);
+            const float sa = h2f((uint16_t) cur.sa), sb = h2f((uint16_t) cur.sb);
+            const uint32_t af0[4] = {q8_pair(cur.a[0]), q8_pair(cur.b[0]), q8_pair(cur.a[1]), q8_pair(cur.b[1])};
+            const uint32_t af1[4] = {q8_pair(cur.a[2]), q8_pair(cur.b[2]), q8_pair(cur.a[3]), q8_pair(cur.b[3])};
 #pragma unroll
-        for (int j = 0; j < NT; ++j) {
-            if (j == 0 || n > 4) {
-                uint4 x = make_uint4(0, 0, 0, 0);
-                if (x_ok[j]) x = __ldg(xp[j] + k * 4);
-                float bs[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                mma16816(bs, af0, x.x, x.y);
-                mma16816(bs, af1, x.z, x.w);
-                v[j][0] += sa * bs[0], v[j][1] += sa * bs[1], v[j][2] += sb * bs[2], v[j][3] += sb * bs[3];
+            for (int j = 0; j < NT; ++j) {
+                if (j == 0 || n > 4) {
+                    uint4 x = make_uint4(0, 0, 0, 0);
+                    if (x_ok[j]) x = __ldg(xp[j] + k * 4);
+                    float bs[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    mma16816(bs, af0, x.x, x.y);
+                    mma16816(bs, af1, x.z, x.w);
+                    v[j][0] += sa * bs[0], v[j][1] += sa * bs[1], v[j][2] += sb * bs[2], v[j][3] += sb * bs[3];
+                }
             }
+            cur = nxt;
         }
-        cur = nxt;
     }
 #pragma unroll
     for (int j = 0; j < NT; ++j)
@@ -5665,20 +5673,22 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
     const uint4* xp = (const uint4*) (h + (size_t) (x_ok ? row_g[grp * kGroupMax + gr] : 0) * F) + t;
     float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const int nk = F / 32;
-    Q8Step cur = q8_step_load(a, b, split, t);
-    for (int k = split; k < nk; k += SPLIT) {
-        Q8Step nxt = cur;
-        if (k + SPLIT < nk) nxt = q8_step_load(a, b, k + SPLIT, t);
-        const float sa = h2f((uint16_t) cur.sa), sb = h2f((uint16_t) cur.sb);
-        const uint32_t af0[4] = {q8_pair(cur.a[0]), q8_pair(cur.b[0]), q8_pair(cur.a[1]), q8_pair(cur.b[1])};
-        const uint32_t af1[4] = {q8_pair(cur.a[2]), q8_pair(cur.b[2]), q8_pair(cur.a[3]), q8_pair(cur.b[3])};
-        uint4 x = make_uint4(0, 0, 0, 0);
-        if (x_ok) x = __ldg(xp + k * 4);
-        float bs[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        mma16816(bs, af0, x.x, x.y);
-        mma16816(bs, af1, x.z, x.w);
-        v[0] += sa * bs[0], v[1] += sa * bs[1], v[2] += sb * bs[2], v[3] += sb * bs[3];
-        cur = nxt;
+    if (split < nk) {
+        Q8Step cur = q8_step_load(a, b, split, t);
+        for (int k = split; k < nk; k += SPLIT) {
+            Q8Step nxt = cur;
+            if (k + SPLIT < nk) nxt = q8_step_load(a, b, k + SPLIT, t);
+            const float sa = h2f((uint16_t) cur.sa), sb = h2f((uint16_t) cur.sb);
+            const uint32_t af0[4] = {q8_pair(cur.a[0]), q8_pair(cur.b[0]), q8_pair(cur.a[1]), q8_pair(cur.b[1])};
+            const uint32_t af1[4] = {q8_pair(cur.a[2]), q8_pair(cur.b[2]), q8_pair(cur.a[3]), q8_pair(cur.b[3])};
+            uint4 x = make_uint4(0, 0, 0, 0);
+            if (x_ok) x = __ldg(xp + k * 4);
+            float bs[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            mma16816(bs, af0, x.x, x.y);
+            mma16816(bs, af1, x.z, x.w);
+            v[0] += sa * bs[0], v[1] += sa * bs[1], v[2] += sb * bs[2], v[3] += sb * bs[3];
+            cur = nxt;
+        }
     }
     part[split][lane] = make_float4(v[0], v[1], v[2], v[3]);
     __syncthreads();

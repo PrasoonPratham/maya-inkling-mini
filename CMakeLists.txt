@@ -21,7 +21,7 @@ add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Z7>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zi>)
   add_link_options(/DEBUG /OPT:REF /OPT:ICF)
 endif()
 

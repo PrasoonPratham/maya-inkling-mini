@@ -160,6 +160,8 @@ void loop_gate(const float* x, const float* m, const float* D, const float* F, c
 /// (F32).  scratch: cand_scratch(n) ints.
 size_t cand_scratch(int n);
 void cand_topk(const float* x, int n, float lo, float hi, int K, int cap, int* scratch, int* out, cudaStream_t s);
+void cand_topk_softcap_rows(const float* x, int ld, int T, int n, float logit_cap, int K, int cap_out, int* scratch,
+                            int* out, int out_stride, cudaStream_t s);
 /// The same gate over a chunk of tokens with its products taken as matrix products by the caller (loop_gates'
 /// kernels are a token's): loop_gate_mix gives g [T][R] = a1 / rms(x) + a2 / rms(m) of a1 = x D_x^T, a2 = m D_m^T
 /// ([T][R]); loop_gate_blend y = (1 - tanh f) x + tanh(gn) m of f = g F, gn = g G ([T][C]; n = T C; y may be x).

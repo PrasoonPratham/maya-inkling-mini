@@ -2670,9 +2670,9 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         if (out_mode == OutMode::kArgmax) {
             k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, 4, cudaMemcpyDeviceToHost, g_s));
-        } else if (out_mode == OutMode::kCand) {   // (the softcap keeps the logits within +- logit_cap)
-            k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
-            k::cand_topk(W.logits, c.n_vocab, -c.logit_cap, c.logit_cap, kCandK, kCandCap, W.cand_part, W.cand_d, g_s);
+        } else if (out_mode == OutMode::kCand) {   // (the softcap fused into candidate gather)
+            k::cand_topk_softcap_rows(W.logits, c.n_rows, 1, c.n_vocab, c.logit_cap, kCandK, kCandCap, W.cand_part,
+                                      W.cand_d, 2 + 2 * kCandCap, g_s);
             CU(cudaMemcpyAsync(W.cand_h, W.cand_d, (size_t) (2 + 2 * kCandCap) * 4, cudaMemcpyDeviceToHost, g_s));
         } else {
             k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
@@ -2741,6 +2741,10 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
             g_cand.n = W.cand_h[0], g_cand.idx = W.cand_h + 2, g_cand.val = (const float*) (W.cand_h + 2 + kCandCap);
         } else {   // (more than the buffer holds - logits flat past belief: the logits themselves, this once)
             CU(cudaMemcpy(W.logits_h, W.logits, (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost));
+            if (c.logit_cap > 0.0f) {
+                const float inv_cap = 1.0f / c.logit_cap;
+                for (int v = 0; v < c.n_vocab; ++v) W.logits_h[v] = c.logit_cap * std::tanh(W.logits_h[v] * inv_cap);
+            }
             logits_out.insert(logits_out.end(), W.logits_h, W.logits_h + c.n_vocab);
             g_cand.n = -1;
         }
@@ -2765,7 +2769,7 @@ struct BlockBufs {
     float* lp_msg = nullptr;     // a pass's messages, [n_core][4][kBlockMax][C]
     k::ConvRec* recs = nullptr;  // every visit's four convs (rollback_block)
     int n_recs = 0;
-    int *cand_d = nullptr, *cand_h = nullptr;   // kCand: each row's k::cand_topk out, [kBlockMax][2 + 2 kCandCap]
+    int *cand_d = nullptr, *cand_h = nullptr, *cand_part = nullptr;   // kCand: [kBlockMax][2 + 2 kCandCap] + scratch
 };
 BlockBufs g_blk;
 FastGraph g_bgraph[kBlockMax + 1][4];   // by window size and OutMode
@@ -2779,6 +2783,7 @@ void block_init(Model& M) {
     CU(cudaHostAlloc(&g_blk.logits_h, (size_t) kBlockMax * c.n_vocab * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&g_blk.cand_h, (size_t) kBlockMax * (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
     g_blk.cand_d = dalloc<int>((size_t) kBlockMax * (2 + 2 * kCandCap));
+    g_blk.cand_part = dalloc<int>((size_t) kBlockMax * k::cand_scratch(c.n_vocab));
     g_blk.blob = dalloc<const uint8_t*>(S);
     g_blk.n = dalloc<int>(S), g_blk.inv = dalloc<int>(S);
     g_blk.tok = dalloc<int>((size_t) S * k::kGroupMax), g_blk.row = dalloc<int>((size_t) S * k::kGroupMax);
@@ -3041,12 +3046,10 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (out_mode == OutMode::kArgmax) {
             k::argmax_rows(W.logits, c.n_rows, T, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
-        } else if (out_mode == OutMode::kCand) {   // (each row's candidates, as the token path's)
+        } else if (out_mode == OutMode::kCand) {   // (batched softcap-fused candidate top-k: 3 launches total for all T)
             const size_t cs = 2 + 2 * (size_t) kCandCap;
-            k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
-            for (int t = 0; t < T; ++t)
-                k::cand_topk(W.logits + (size_t) t * c.n_rows, c.n_vocab, -c.logit_cap, c.logit_cap, kCandK, kCandCap,
-                             W.cand_part, g_blk.cand_d + t * cs, g_s);
+            k::cand_topk_softcap_rows(W.logits, c.n_rows, T, c.n_vocab, c.logit_cap, kCandK, kCandCap, g_blk.cand_part,
+                                      g_blk.cand_d, (int) cs, g_s);
             CU(cudaMemcpyAsync(g_blk.cand_h, g_blk.cand_d, (size_t) T * cs * 4, cudaMemcpyDeviceToHost, g_s));
         } else {
             k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
@@ -3137,46 +3140,65 @@ struct SampleCfg {   // temp <= 0: greedy
     int top_k = 0;
     std::mt19937_64* rng = nullptr;
 };
-// the serve loop's sampling distribution over candidates cd (logit, token): softmax(logit / temp) over the top_p
-// mass of the min(top_k, kCandK) largest (ties: the lower token first) - pick_top's - as (token, probability)
-std::vector<std::pair<int, double>> sample_dist(std::vector<std::pair<float, int>>& cd, const SampleCfg& sc) {
-    const int kk = std::min((int) cd.size(), sc.top_k > 0 ? std::min(sc.top_k, kCandK) : kCandK);
-    std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(),
-                      [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
-                          return a.first > b.first || (a.first == b.first && a.second < b.second);
-                      });
-    std::vector<double> pr(kk);
-    double z = 0;
-    for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((cd[j].first - cd[0].first) / sc.temp));
-    double acc = 0;
-    int keep = kk;
+// Zero-alloc fast candidate preparation: isolates top-kk (O(N) nth_element when top_p>=1, partial_sort otherwise),
+// writes unnormalized probabilities into pr[0..keep-1] and returns (keep, sum_pr).
+static std::pair<int, float> prep_cand_probs(std::vector<std::pair<float, int>>& cd, double temp, double top_p,
+                                             int top_k, float* pr) {
+    const int kk = std::min((int) cd.size(), top_k > 0 ? std::min(top_k, kCandK) : kCandK);
+    auto cmp = [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
+    };
+    float vmax;
+    if (top_p >= 1.0) {
+        if (kk < (int) cd.size()) std::nth_element(cd.begin(), cd.begin() + kk, cd.end(), cmp);
+        vmax = cd[0].first;
+        for (int j = 1; j < kk; ++j)
+            if (cd[j].first > vmax) vmax = cd[j].first;
+    } else {
+        std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(), cmp);
+        vmax = cd[0].first;
+    }
+    const float inv_t = 1.0f / (float) temp;
+    float z = 0.0f;
     for (int j = 0; j < kk; ++j) {
-        acc += pr[j] / z;
-        if (acc >= sc.top_p) {
-            keep = j + 1;
-            break;
+        const float p = std::exp((cd[j].first - vmax) * inv_t);
+        pr[j] = p;
+        z += p;
+    }
+    int keep = kk;
+    float zk = z;
+    if (top_p < 1.0) {
+        const float thresh = (float) top_p * z;
+        float acc = 0.0f;
+        for (int j = 0; j < kk; ++j) {
+            acc += pr[j];
+            if (acc >= thresh) {
+                keep = j + 1;
+                zk = acc;
+                break;
+            }
         }
     }
-    double zk = 0;
-    for (int j = 0; j < keep; ++j) zk += pr[j];
-    std::vector<std::pair<int, double>> out(keep);
-    for (int j = 0; j < keep; ++j) out[j] = {cd[j].second, pr[j] / zk};
-    return out;
+    return {keep, zk};
 }
-int sample_from(const std::vector<std::pair<int, double>>& d, std::mt19937_64& rng, int skip = -1) {
-    double z = 0;
-    for (const auto& e : d)
-        if (e.first != skip) z += e.second;
-    if (z <= 0) return d[0].first;
-    double u = std::uniform_real_distribution<double>(0, z)(rng);
-    for (const auto& e : d) {
-        if (e.first == skip) continue;
-        u -= e.second;
-        if (u <= 0) return e.first;
+static int sample_from_pr(const std::vector<std::pair<float, int>>& cd, const float* pr, int keep, float zk,
+                          std::mt19937_64& rng, int skip = -1) {
+    float z = zk;
+    if (skip >= 0) {
+        z = 0.0f;
+        for (int j = 0; j < keep; ++j)
+            if (cd[j].second != skip) z += pr[j];
     }
-    for (auto it = d.rbegin(); it != d.rend(); ++it)
-        if (it->first != skip) return it->first;
-    return d[0].first;
+    if (z <= 0.0f) return cd[0].second;
+    float u = (float) (std::uniform_real_distribution<double>(0.0, (double) z)(rng));
+    for (int j = 0; j < keep; ++j) {
+        if (cd[j].second == skip) continue;
+        u -= pr[j];
+        if (u <= 0.0f) return cd[j].second;
+    }
+    for (int j = keep - 1; j >= 0; --j)
+        if (cd[j].second != skip) return cd[j].second;
+    return cd[0].second;
 }
 
 // When to draft and how wide (IK2_DRAFT_WIDTH the widest; IK2_DRAFT_ADAPT=0: always that wide): a step's expected
@@ -3292,27 +3314,33 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         // else sample the target's distribution without d - the target's distribution exactly
         fast_block(M, tk, B, P, OutMode::kCand, lo, nullptr);
         g_last_captured = g_last_captured || draft_cap;
+        static std::vector<std::pair<float, int>> cd_buf;
+        static float pr_buf[kCandK];
         for (int j = 0; j < B; ++j) {
-            std::vector<std::pair<float, int>> cd;
-            if (!block_cands(M, j, cd)) {   // (more candidates than kept: the row's logits)
+            if (!block_cands(M, j, cd_buf)) {   // (more candidates than kept: the row's logits)
                 std::vector<float> row((size_t) c.n_vocab);
                 CU(cudaMemcpy(row.data(), dev_work(0).logits + (size_t) j * c.n_rows, (size_t) c.n_vocab * 4,
                               cudaMemcpyDeviceToHost));
-                cd.resize(c.n_vocab);
-                for (int v = 0; v < c.n_vocab; ++v) cd[v] = {row[v], v};
+                const float inv_cap = c.logit_cap > 0.0f ? (1.0f / c.logit_cap) : 0.0f;
+                cd_buf.resize(c.n_vocab);
+                for (int v = 0; v < c.n_vocab; ++v)
+                    cd_buf[v] = {c.logit_cap > 0.0f ? (c.logit_cap * std::tanh(row[v] * inv_cap)) : row[v], v};
             }
-            const auto dist = sample_dist(cd, sc);
+            const auto [keep, zk] = prep_cand_probs(cd_buf, sc.temp, sc.top_p, sc.top_k, pr_buf);
             if (j == B - 1) {
-                next.push_back(sample_from(dist, *sc.rng));
+                next.push_back(sample_from_pr(cd_buf, pr_buf, keep, zk, *sc.rng));
                 break;
             }
-            double pd = 0;
-            for (const auto& e : dist)
-                if (e.first == dr[j]) pd = e.second;
-            if (std::uniform_real_distribution<double>(0, 1)(*sc.rng) < pd) {
+            float pd_num = 0.0f;
+            for (int i = 0; i < keep; ++i)
+                if (cd_buf[i].second == dr[j]) {
+                    pd_num = pr_buf[i];
+                    break;
+                }
+            if (std::uniform_real_distribution<double>(0.0, (double) zk)(*sc.rng) < (double) pd_num) {
                 next.push_back(dr[j]);
             } else {
-                next.push_back(sample_from(dist, *sc.rng, dr[j]));
+                next.push_back(sample_from_pr(cd_buf, pr_buf, keep, zk, *sc.rng, dr[j]));
                 break;
             }
         }
@@ -5862,43 +5890,22 @@ int main(int argc, char** argv) {
             // softmax(logits / T) over the top_p mass of the 1000 largest of the (logit, token) pairs given (the
             // whole vocabulary, or the candidates the resident token path found on the device: every logit of the
             // highest bins that hold 1000 - the same 1000 either way; ties: the lower token first)
+            static std::vector<std::pair<float, int>> serve_cd;
+            static float serve_pr[kCandK];
             auto pick_top = [&](std::vector<std::pair<float, int>>& cd) -> int {
-                const int kk = std::min((int) cd.size(), top_k > 0 ? std::min(top_k, kCandK) : kCandK);
-                std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(),
-                                  [](const std::pair<float, int>& a2, const std::pair<float, int>& b2) {
-                                      return a2.first > b2.first || (a2.first == b2.first && a2.second < b2.second);
-                                  });
-                std::vector<double> pr(kk);
-                double z = 0;
-                for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((cd[j].first - cd[0].first) / temp));
-                double acc = 0;
-                int keep = kk;
-                for (int j = 0; j < kk; ++j) {
-                    acc += pr[j] / z;
-                    if (acc >= top_p) {
-                        keep = j + 1;
-                        break;
-                    }
-                }
-                double zk = 0;
-                for (int j = 0; j < keep; ++j) zk += pr[j];
-                double u = std::uniform_real_distribution<double>(0, zk)(rng);
-                for (int j = 0; j < keep; ++j) {
-                    u -= pr[j];
-                    if (u <= 0) return cd[j].second;
-                }
-                return cd[keep - 1].second;
+                const auto [keep, zk] = prep_cand_probs(cd, temp, top_p, top_k, serve_pr);
+                return sample_from_pr(cd, serve_pr, keep, zk, rng);
             };
             auto pick = [&](const float* r) -> int {
                 if (temp <= 0) return (int) (std::max_element(r, r + c.n_vocab) - r);
-                std::vector<std::pair<float, int>> cd(c.n_vocab);
-                for (int v = 0; v < c.n_vocab; ++v) cd[v] = {r[v], v};
-                return pick_top(cd);
+                serve_cd.resize(c.n_vocab);
+                for (int v = 0; v < c.n_vocab; ++v) serve_cd[v] = {r[v], v};
+                return pick_top(serve_cd);
             };
             auto pick_cand = [&]() -> int {
-                std::vector<std::pair<float, int>> cd(g_cand.n);
-                for (int i = 0; i < g_cand.n; ++i) cd[i] = {g_cand.val[i], g_cand.idx[i]};
-                return pick_top(cd);
+                serve_cd.resize(g_cand.n);
+                for (int i = 0; i < g_cand.n; ++i) serve_cd[i] = {g_cand.val[i], g_cand.idx[i]};
+                return pick_top(serve_cd);
             };
             // IK2_CAND=0: sampling takes the whole vocabulary's logits from the device every token
             const bool use_cand = !(getenv("IK2_CAND") && !std::atoi(getenv("IK2_CAND")));
@@ -5972,7 +5979,6 @@ int main(int argc, char** argv) {
                     std::vector<int> next;
                     const double ts = now();
                     spec_step(M, drafter, tok, (int) hist.size(), B, sc, stops, next);
-                    CU(cudaStreamSynchronize(g_s));
                     sctl.took_spec(B, (int) next.size() - 1, now() - ts);
                     hist.push_back(tok);
                     for (size_t j = 0; j + 1 < next.size(); ++j) {
@@ -6006,11 +6012,10 @@ int main(int argc, char** argv) {
                     cand = use_cand && g_cand.n >= 0;
                     last = std::move(lo);
                 }
-                if (spec_on) {   // (the drafter's context for the token: its taps, row 0)
+                if (spec_on) {   // (the drafter's context for the token: its taps, row 0; overlaps with CPU sampling)
                     bool ctx_cap = false;
                     ik2::draft::commit_context(drafter, g_taps, g_taps_ld, 1, (int) hist.size(), &ctx_cap);
                     g_last_captured = g_last_captured || ctx_cap;
-                    CU(cudaStreamSynchronize(g_s));
                     sctl.took_plain(now() - tp0);
                 }
                 hist.push_back(tok);

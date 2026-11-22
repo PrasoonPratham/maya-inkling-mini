@@ -2110,6 +2110,111 @@ __global__ void cand_gather_kernel(const float* __restrict__ x, int n, float lo,
     if (at < cap) idx[at] = i, val[at] = v;
 }
 
+__device__ __forceinline__ float softcap_val(float v, float cap, float inv_cap) {
+    return cap > 0.0f ? (cap * tanhf(v * inv_cap)) : v;
+}
+
+__global__ void cand_hist_softcap_rows_kernel(const float* __restrict__ x, int ld, int n, float cap, float inv_cap,
+                                              float lo, float inv_w, int per, int n_part, int* __restrict__ part) {
+    __shared__ int h[kCandBins];
+    for (int j = threadIdx.x; j < kCandBins; j += blockDim.x) h[j] = 0;
+    __syncthreads();
+    const int t = blockIdx.y;
+    const float* xr = x + (size_t) t * ld;
+    const int i0 = blockIdx.x * per, i1 = min(n, i0 + per);
+    const bool vec4 = (((uintptr_t) xr & 15) == 0) && ((i0 & 3) == 0);
+    if (vec4) {
+        const int i1_4 = i1 & ~3;
+        const float4* x4 = (const float4*) xr;
+        for (int i = i0 + threadIdx.x * 4; i < i1_4; i += blockDim.x * 4) {
+            const float4 f = __ldg(x4 + (i >> 2));
+            atomicAdd(&h[cand_bin(softcap_val(f.x, cap, inv_cap), lo, inv_w)], 1);
+            atomicAdd(&h[cand_bin(softcap_val(f.y, cap, inv_cap), lo, inv_w)], 1);
+            atomicAdd(&h[cand_bin(softcap_val(f.z, cap, inv_cap), lo, inv_w)], 1);
+            atomicAdd(&h[cand_bin(softcap_val(f.w, cap, inv_cap), lo, inv_w)], 1);
+        }
+        for (int i = i1_4 + threadIdx.x; i < i1; i += blockDim.x)
+            atomicAdd(&h[cand_bin(softcap_val(__ldg(xr + i), cap, inv_cap), lo, inv_w)], 1);
+    } else {
+        for (int i = i0 + threadIdx.x; i < i1; i += blockDim.x)
+            atomicAdd(&h[cand_bin(softcap_val(__ldg(xr + i), cap, inv_cap), lo, inv_w)], 1);
+    }
+    __syncthreads();
+    int* dst = part + ((size_t) t * n_part + blockIdx.x) * kCandBins;
+    for (int j = threadIdx.x; j < kCandBins; j += blockDim.x) dst[j] = h[j];
+}
+
+__global__ void cand_threshold_rows_kernel(const int* __restrict__ part, int n_part, int K, int* __restrict__ out,
+                                           int out_stride) {
+    __shared__ int cnt[kCandBins];
+    __shared__ int wcnt[kCandBins / 32];
+    const int t = blockIdx.x, j = threadIdx.x, lane = j & 31, warp = j >> 5;
+    const int* pt = part + (size_t) t * n_part * kCandBins;
+    int c = 0;
+    for (int b = 0; b < n_part; ++b) c += pt[(size_t) b * kCandBins + j];
+    cnt[j] = c;
+    int ws = c;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ws += __shfl_xor_sync(0xffffffffu, ws, o);
+    if (lane == 0) wcnt[warp] = ws;
+    __syncthreads();
+    int above = 0;
+    for (int w = warp + 1; w < kCandBins / 32; ++w) above += wcnt[w];
+    for (int i = j + 1; i < (warp + 1) * 32; ++i) above += cnt[i];
+    int* head = out + (size_t) t * out_stride;
+    if (above < K && above + c >= K) head[1] = j;
+    if (j == 0) {
+        head[0] = 0;
+        if (above + c < K) head[1] = 0;
+    }
+}
+
+__global__ void cand_gather_softcap_rows_kernel(const float* __restrict__ x, int ld, int n, float cap, float inv_cap,
+                                                float lo, float inv_w, int cap_out, int* __restrict__ out,
+                                                int out_stride) {
+    const int t = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const float* xr = x + (size_t) t * ld;
+    int* head = out + (size_t) t * out_stride;
+    const int thresh = head[1];
+    int* idx = head + 2;
+    float* val = (float*) (head + 2 + cap_out);
+    const int i4 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int base_i = i4 << 2;
+    int cnt = 0;
+    int li[4];
+    float lv[4];
+    const bool vec4 = (((uintptr_t) xr & 15) == 0);
+    if (base_i + 3 < n && vec4) {
+        const float4 f = __ldg((const float4*) xr + i4);
+        const float vs[4] = {softcap_val(f.x, cap, inv_cap), softcap_val(f.y, cap, inv_cap),
+                             softcap_val(f.z, cap, inv_cap), softcap_val(f.w, cap, inv_cap)};
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            if (cand_bin(vs[k], lo, inv_w) >= thresh) li[cnt] = base_i + k, lv[cnt] = vs[k], ++cnt;
+    } else if (base_i < n) {
+        for (int k = 0; k < 4 && base_i + k < n; ++k) {
+            const float v = softcap_val(__ldg(xr + base_i + k), cap, inv_cap);
+            if (cand_bin(v, lo, inv_w) >= thresh) li[cnt] = base_i + k, lv[cnt] = v, ++cnt;
+        }
+    }
+    int off = cnt;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const int u = __shfl_up_sync(0xffffffffu, off, d);
+        if (lane >= d) off += u;
+    }
+    const int warp_tot = __shfl_sync(0xffffffffu, off, 31);
+    int wbase = 0;
+    if (lane == 31 && warp_tot > 0) wbase = atomicAdd(head, warp_tot);
+    wbase = __shfl_sync(0xffffffffu, wbase, 31);
+    const int my_base = wbase + off - cnt;
+    for (int k = 0; k < cnt; ++k) {
+        const int at = my_base + k;
+        if (at < cap_out) idx[at] = li[k], val[at] = lv[k];
+    }
+}
+
 // The gates of a chunk of tokens: their two products (g = D [rms(x); rms(m)], then F g and G g) are matrix products
 // taken outside, and these are what is left.  (1) g [T][R] = a1 / rms(x) + a2 / rms(m), a1 = x D_x^T and
 // a2 = m D_m^T; a block a token.
@@ -5975,6 +6080,23 @@ void cand_topk(const float* x, int n, float lo, float hi, int K, int cap, int* s
     check("cand_topk (threshold)");
     cand_gather_kernel<<<grid((size_t) n), kBlk, 0, s>>>(x, n, lo, inv_w, cap, out, out + 2, (float*) (out + 2 + cap));
     check("cand_topk (gather)");
+}
+void cand_topk_softcap_rows(const float* x, int ld, int T, int n, float logit_cap, int K, int cap_out, int* scratch,
+                            int* out, int out_stride, cudaStream_t s) {
+    if (n <= 0 || T <= 0) return;
+    const float lo = -logit_cap, hi = logit_cap;
+    const float inv_w = (float) kCandBins / (hi - lo);
+    const float inv_cap = logit_cap > 0.0f ? (1.0f / logit_cap) : 0.0f;
+    const int n_part = (n + kCandPer - 1) / kCandPer;
+    cand_hist_softcap_rows_kernel<<<dim3((unsigned) n_part, (unsigned) T), kBlk, 0, s>>>(
+        x, ld, n, logit_cap, inv_cap, lo, inv_w, kCandPer, n_part, scratch);
+    check("cand_topk_softcap_rows (histogram)");
+    cand_threshold_rows_kernel<<<(unsigned) T, kCandBins, 0, s>>>(scratch, n_part, K, out, out_stride);
+    check("cand_topk_softcap_rows (threshold)");
+    const int n4 = (n + 3) >> 2;
+    cand_gather_softcap_rows_kernel<<<dim3((unsigned) ((n4 + kBlk - 1) / kBlk), (unsigned) T), kBlk, 0, s>>>(
+        x, ld, n, logit_cap, inv_cap, lo, inv_w, cap_out, out, out_stride);
+    check("cand_topk_softcap_rows (gather)");
 }
 void loop_gate_mix(const float* x, const float* m, const float* a1, const float* a2, int T, int C, int R, float eps,
                    float* g, cudaStream_t s) {
